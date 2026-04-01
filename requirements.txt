@@ -1,3 +1,4 @@
 music21
-yt-dlp
-pretty_midi
+librosa
+numpy
+flask

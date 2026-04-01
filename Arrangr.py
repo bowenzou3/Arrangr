@@ -1,43 +1,8 @@
 import os
+from pathlib import Path
 from music21 import stream, note, chord, tempo
-import yt_dlp
-import pretty_midi
 import librosa
 import numpy as np
-
-# ===========================
-# YouTube Audio Downloader
-# ===========================
-def download_audio(url, output_name="song", browser=None):
-    """Download YouTube audio and save as WAV"""
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': f'{output_name}.%(ext)s',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'wav',
-            'preferredquality': '192',
-        }],
-        'quiet': True, # Suppress yt_dlp output for cleaner console
-        'nocheckcertificate': True, # Often needed for YouTube downloads
-    }
-    if browser:
-        ydl_opts['http_headers'] = {'User-Agent': browser}
-
-    output_path = f"{output_name}.wav"
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        # yt_dlp might add an extension to output_name, so we need to find the actual file
-        # This part is a bit hacky, as yt_dlp renames the file if it already exists
-        # A more robust solution might involve parsing ydl.download's return or checking the directory
-        for file in os.listdir('.'):
-            if file.startswith(output_name) and file.endswith('.wav'):
-                return file
-        return output_path # Fallback if file not found (shouldn't happen with correct output)
-    except Exception as e:
-        print(f"Error downloading audio: {e}")
-        return None
 
 # ===========================
 # SATB Arrangement Logic
@@ -167,67 +132,6 @@ def arrange(chord_progression, melody_notes):
     return score
 
 # ===========================
-# MIDI Helper Functions
-# ===========================
-def midi_to_chords_and_melody(midi_file_path):
-    """Convert MIDI to chord progression + melody (simplified)"""
-    midi_data = pretty_midi.PrettyMIDI(midi_file_path)
-    chord_list = []
-    melody_list = []
-
-    if len(midi_data.instruments) == 0:
-        raise Exception("No instruments found in MIDI file")
-
-    # Simple heuristic: often the first instrument is a lead melody, or the highest pitches.
-    # For now, let's process all notes and pick highest for melody, and all for chord.
-
-    # Quantize time steps for analysis
-    time_step = 0.5  # seconds, controls granularity of chord/melody extraction
-    current_time = 0.0
-    end_time = midi_data.get_end_time()
-
-    # Estimate BPM for more accurate duration assignment in music21
-    # pretty_midi's estimate_tempo can be used, but librosa also has tempo functions if using audio directly
-    estimated_tempo = midi_data.estimate_tempo()
-    # music21 requires tempo.MetronomeMark object for tempo
-    metronome_mark = tempo.MetronomeMark(number=estimated_tempo)
-
-    while current_time < end_time + time_step: # Ensure last notes are included
-        notes_at_current_time = []
-        for inst in midi_data.instruments:
-            for n in inst.notes:
-                # Consider notes that are active at or begin before the current_time step and end after it
-                if n.start <= current_time < n.end or \
-                   (current_time <= n.start < current_time + time_step): # Notes starting within the window
-                    notes_at_current_time.append(n)
-
-        if notes_at_current_time:
-            # Create a chord from all active notes (or notes starting in this window)
-            # Remove duplicates for chord formation
-            chord_pitches_midi = sorted(list(set([n.pitch for n in notes_at_current_time])))
-            current_music21_chord = chord.Chord(chord_pitches_midi) if chord_pitches_midi else chord.Chord()
-
-            # Determine duration based on time_step, or actual note durations if more precise
-            current_music21_chord.duration.quarterLength = (time_step * estimated_tempo / 60.0)  # Convert seconds to quarterLength
-
-            chord_list.append(current_music21_chord)
-
-            # Pick the highest pitch as melody for this time slice
-            melody_midi = max(notes_at_current_time, key=lambda n: n.pitch).pitch
-            melody_note = note.Note(melody_midi)
-            melody_note.duration.quarterLength = (time_step * estimated_tempo / 60.0)
-            melody_list.append(melody_note)
-        else:
-            # If no notes, add a rest for both chord and melody to maintain timing
-            rest_duration_ql = (time_step * estimated_tempo / 60.0)
-            chord_list.append(chord.Chord().augmentOrDiminish(rest_duration_ql, inPlace=False)) # Placeholder chord with rest duration
-            melody_list.append(note.Rest(quarterLength=rest_duration_ql))
-
-        current_time += time_step
-
-    return chord_list, melody_list
-
-# ===========================
 # Audio Processing (MP3/WAV)
 # ===========================
 def audio_to_chords_and_melody(audio_file_path):
@@ -351,68 +255,9 @@ def audio_to_chords_and_melody(audio_file_path):
 # ===========================
 # Main Application Logic
 # ===========================
-def main():
-    print("=== Arrangr ===")
-    print("Welcome to Arrangr: Your automatic SATB + Solo arranger!")
-    print("Input options:")
-    print("  'yt': Download audio from a YouTube URL.")
-    print("  'audio': Use a local audio file (MP3/WAV).")
-    print("  'midi': Use a local MIDI file.")
-
-    choice = input("Please choose an input method (yt/audio/midi): ").strip().lower()
-
-    chord_prog = []
-    melody = []
-    output_filename_base = "arranged_score"
-
-    if choice == 'yt':
-        url = input("Enter YouTube URL: ").strip()
-        print("Downloading audio from YouTube...")
-        wav_file = download_audio(url, output_name='downloaded_song')
-        if not wav_file:
-            print("Failed to download audio. Exiting.")
-            return
-        print(f"Downloaded audio to {wav_file}. Analyzing...")
-        chord_prog, melody = audio_to_chords_and_melody(wav_file)
-        output_filename_base = os.path.splitext(wav_file) + "_arranged"
-
-    elif choice == 'audio':
-        audio_path = input("Enter path to local audio file (e.g., my_song.mp3 or my_song.wav): ").strip()
-        if not os.path.exists(audio_path):
-            print(f"Error: File not found at {audio_path}. Exiting.")
-            return
-        print(f"Analyzing local audio file: {audio_path}...")
-        chord_prog, melody = audio_to_chords_and_melody(audio_path)
-        output_filename_base = os.path.splitext(audio_path) + "_arranged"
-
-    elif choice == 'midi':
-        midi_path = input("Enter path to local MIDI file (e.g., my_song.mid): ").strip()
-        if not os.path.exists(midi_path):
-            print(f"Error: File not found at {midi_path}. Exiting.")
-            return
-        print(f"Analyzing local MIDI file: {midi_path}...")
-        chord_prog, melody = midi_to_chords_and_melody(midi_path)
-        output_filename_base = os.path.splitext(midi_path) + "_arranged"
-
-    else:
-        print("Invalid option selected. Please choose 'yt', 'audio', or 'midi'. Exiting.")
-        return
-
-    if not chord_prog or not melody:
-        print("Could not extract sufficient musical information. Arrangement cancelled.")
-        return
-
-    print("Arranging SATB + Solo from extracted music data...")
-    score = arrange(chord_prog, melody)
-
-    output_file = f"{output_filename_base}.musicxml"
-    try:
-        score.write("musicxml", fp=output_file)
-        print(f"Sheet music generated successfully: {output_file}")
-        print("You can open this file in MuseScore, Finale, Sibelius, or any MusicXML compatible software to view the arrangement.")
-    except Exception as e:
-        print(f"Error writing MusicXML file: {e}")
-        print("Please ensure you have a MusicXML viewer installed and that music21 can write to the specified path.")
-
 if __name__ == "__main__":
-    main()
+    # This file is meant to be imported by app.py
+    # For direct usage, run: python app.py
+    print("Arrangr - SATB + Solo Arranger")
+    print("Starting web interface...")
+    print("Please run: python app.py")
