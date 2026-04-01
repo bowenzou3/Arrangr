@@ -2,3 +2,7 @@ music21
 librosa
 numpy
 flask
+requests==2.31.0
+urllib3==1.26.16
+charset-normalizer==3.2.0
+chardet==5.2.0

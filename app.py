@@ -1,5 +1,7 @@
 from flask import Flask, render_template, request, jsonify
 import os
+import traceback
+import uuid
 from pathlib import Path
 from Arrangr import audio_to_chords_and_melody, arrange
 import threading
@@ -9,8 +11,7 @@ app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-processing = False
-status_message = "Ready"
+jobs = {}
 
 @app.route('/')
 def index():
@@ -18,71 +19,77 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    global processing, status_message
-    
-    if processing:
-        return jsonify({'error': 'Already processing a file. Please wait.'}), 400
-    
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
-    
+
     file = request.files['file']
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
-    
-    if not file.filename.lower().endswith(('.mp3', '.wav')):
-        return jsonify({'error': 'File must be MP3 or WAV format'}), 400
-    
-    try:
-        processing = True
-        status_message = "Uploading..."
-        
-        # Save uploaded file
-        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-        file.save(filepath)
-        
-        status_message = "Analyzing audio..."
-        
-        # Process in background thread
-        def process():
-            global status_message
-            try:
-                status_message = "Extracting chords and melody..."
-                chord_prog, melody = audio_to_chords_and_melody(filepath)
-                
-                if not chord_prog or not melody:
-                    raise ValueError("Could not extract musical information")
-                
-                status_message = "Creating SATB arrangement..."
-                score = arrange(chord_prog, melody)
-                
-                output_filename = os.path.splitext(file.filename)[0] + "_arranged.musicxml"
-                output_path = os.path.join(UPLOAD_FOLDER, output_filename)
-                score.write("musicxml", fp=output_path)
-                
-                status_message = f"✓ Success! File: {output_filename}"
-                return True, output_filename
-            except Exception as e:
-                status_message = f"✗ Error: {str(e)}"
-                return False, str(e)
-        
-        success, result = process()
-        processing = False
-        
-        if success:
-            return jsonify({'success': True, 'filename': result, 'message': status_message})
-        else:
-            return jsonify({'error': result}), 500
-    
-    except Exception as e:
-        processing = False
-        status_message = f"✗ Error: {str(e)}"
-        return jsonify({'error': str(e)}), 500
+
+    if not file.filename.lower().endswith('.mp3'):
+        return jsonify({'error': 'File must be MP3 format'}), 400
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        'status': 'Queued',
+        'processing': True,
+        'message': 'Uploading...',
+        'filename': None,
+        'error': None,
+    }
+
+    filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(filepath)
+
+    def process_job(job_id, filepath, original_name):
+        try:
+            jobs[job_id]['status'] = 'Extracting chords and melody'
+            jobs[job_id]['message'] = 'Extracting chords and melody...'
+
+            chord_prog, melody = audio_to_chords_and_melody(filepath)
+            if not chord_prog or not melody:
+                raise ValueError('Could not extract musical information from audio')
+
+            jobs[job_id]['status'] = 'Creating SATB arrangement'
+            jobs[job_id]['message'] = 'Creating SATB arrangement...'
+
+            score = arrange(chord_prog, melody)
+            output_filename = os.path.splitext(original_name)[0] + '_arranged.musicxml'
+            output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+            score.write('musicxml', fp=output_path)
+
+            jobs[job_id].update({
+                'status': 'Completed',
+                'processing': False,
+                'message': f'✓ Success! File: {output_filename}',
+                'filename': output_filename,
+            })
+        except Exception as e:
+            err_text = f'{type(e).__name__}: {e}\n' + traceback.format_exc()
+            print('[ERROR] upload processing failed:\n' + err_text)
+            jobs[job_id].update({
+                'status': 'Failed',
+                'processing': False,
+                'message': f'✗ Error: {str(e)}',
+                'error': err_text,
+            })
+
+    thread = threading.Thread(target=process_job, args=(job_id, filepath, file.filename), daemon=True)
+    thread.start()
+
+    return jsonify({'job_id': job_id, 'status': 'Processing', 'message': 'File accepted and is being processed.'}), 202
 
 @app.route('/status')
 def get_status():
-    global status_message
-    return jsonify({'status': status_message, 'processing': processing})
+    job_id = request.args.get('job_id')
+    if not job_id:
+        return jsonify({'error': 'Missing job_id parameter'}), 400
+
+    job = jobs.get(job_id)
+    if job is None:
+        return jsonify({'error': 'Invalid job_id'}), 404
+
+    return jsonify(job)
 
 @app.route('/download/<filename>')
 def download_file(filename):

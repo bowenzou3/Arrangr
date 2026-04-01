@@ -256,37 +256,71 @@
             status.className = 'status show processing';
             status.innerHTML = '<div class="spinner"></div>Analyzing audio file...';
             
-            const pollStatus = setInterval(() => {
-                fetch('/status')
-                    .then(r => r.json())
-                    .then(data => {
-                        status.innerHTML = '<div class="spinner"></div>' + data.status;
-                    });
-            }, 500);
-            
             fetch('/upload', {
                 method: 'POST',
                 body: formData
             })
-            .then(r => r.json())
-            .then(data => {
-                clearInterval(pollStatus);
-                if (data.success) {
-                    status.className = 'status show success';
-                    status.innerHTML = `
-                        ✓ ${data.message}<br><br>
-                        <a href="/download/${data.filename}" class="download-btn">⬇ Download MusicXML</a><br>
-                        <button class="reset-btn" onclick="location.reload()">Arrange Another File</button>
-                    `;
-                } else {
-                    status.className = 'status show error';
-                    status.textContent = '✗ ' + data.error;
+            .then(r => {
+                if (!r.ok) {
+                    return r.text().then(text => {
+                        throw new Error(text ? text : `HTTP ${r.status}: ${r.statusText}`);
+                    });
                 }
+                const contentType = r.headers.get('content-type') || '';
+                if (!contentType.includes('application/json')) {
+                    return r.text().then(text => {
+                        throw new Error(`Unexpected response content-type: ${contentType} - ${text}`);
+                    });
+                }
+                return r.json();
+            })
+            .then(data => {
+                if (!data.job_id) {
+                    throw new Error('No job_id returned from server');
+                }
+
+                const jobId = data.job_id;
+                status.className = 'status show processing';
+                status.innerHTML = '<div class="spinner"></div>Job accepted, starting processing...';
+
+                const pollStatus = setInterval(() => {
+                    fetch(`/status?job_id=${jobId}`)
+                        .then(r => {
+                            if (!r.ok) {
+                                return r.text().then(text => {
+                                    throw new Error(text ? text : `HTTP ${r.status}: ${r.statusText}`);
+                                });
+                            }
+                            return r.json();
+                        })
+                        .then(job => {
+                            if (job.status === 'Completed') {
+                                clearInterval(pollStatus);
+                                status.className = 'status show success';
+                                status.innerHTML = `
+                                    ✓ ${job.message}<br><br>
+                                    <a href="/download/${job.filename}" class="download-btn">⬇ Download MusicXML</a><br>
+                                    <button class="reset-btn" onclick="location.reload()">Arrange Another File</button>
+                                `;
+                            } else if (job.status === 'Failed') {
+                                clearInterval(pollStatus);
+                                status.className = 'status show error';
+                                status.textContent = job.message || '✗ Processing failed';
+                            } else {
+                                status.className = 'status show processing';
+                                status.innerHTML = '<div class="spinner"></div>' + (job.message || job.status);
+                            }
+                        })
+                        .catch(err => {
+                            clearInterval(pollStatus);
+                            status.className = 'status show error';
+                            status.textContent = '✗ Status polling error: ' + err;
+                        });
+                }, 2000);
             })
             .catch(err => {
-                clearInterval(pollStatus);
                 status.className = 'status show error';
-                status.textContent = '✗ Error: ' + err;
+                status.textContent = '✗ Upload error: ' + err;
             });
         }
     </script>

@@ -1,8 +1,13 @@
+import warnings
 import os
 from pathlib import Path
 from music21 import stream, note, chord, tempo
 import librosa
 import numpy as np
+from requests.exceptions import RequestsDependencyWarning
+
+# suppress known requests dependency-version warning when environment has newer urllib3/charset-normalizer
+warnings.filterwarnings('ignore', category=RequestsDependencyWarning)
 
 # ===========================
 # SATB Arrangement Logic
@@ -26,7 +31,20 @@ def fit_to_range(pitch, low, high):
 def voice_chord(ch):
     """Convert a music21 chord into SATB notes, prioritizing root, third, fifth"""
     # Ensure chord has at least 3 distinct pitches for basic triad
-    unique_pitches = sorted(list(set([p.midi for p in ch.pitches])))
+    # Use normalized int pitches and avoid unhashable values from weird pitch objects
+    pitch_values = []
+    for p in ch.pitches:
+        try:
+            pitch_values.append(int(p.midi))
+        except Exception:
+            continue
+
+    unique_pitches = []
+    for pv in pitch_values:
+        if pv not in unique_pitches:
+            unique_pitches.append(pv)
+
+    unique_pitches = sorted(unique_pitches)
 
     if len(unique_pitches) < 3: # Need at least root, third, fifth
         # Fallback for simple chords or arpeggios: just use original notes or a simplified voicing
@@ -60,10 +78,10 @@ def voice_chord(ch):
     third_val = pitches[1] if len(pitches) > 1 else root_val + 4 # Default to major third
     fifth_val = pitches[2] if len(pitches) > 2 else root_val + 7 # Default to perfect fifth
 
-    s_midi = fit_to_range(fifth_val, *RANGES)
-    a_midi = fit_to_range(third_val, *RANGES)
-    t_midi = fit_to_range(root_val, *RANGES)
-    b_midi = fit_to_range(root_val - 12, *RANGES) # Bass often an octave lower
+    s_midi = fit_to_range(fifth_val, *RANGES['soprano'])
+    a_midi = fit_to_range(third_val, *RANGES['alto'])
+    t_midi = fit_to_range(root_val, *RANGES['tenor'])
+    b_midi = fit_to_range(root_val - 12, *RANGES['bass'])  # Bass often an octave lower
 
     # Ensure notes are within range and prevent excessive doubling on small chords
     # Simple check to avoid all voices playing the same note
@@ -97,7 +115,7 @@ def arrange(chord_progression, melody_notes):
     # Assume melody_notes and chord_progression are synchronized in length or duration
     # This simplification means each melody note will have a corresponding chord for voicing
     for i, mel_note in enumerate(melody_notes):
-        current_chord = chord_progression if i < len(chord_progression) else chord.Chord() # Fallback
+        current_chord = chord_progression[i] if i < len(chord_progression) else chord.Chord() # Fallback
 
         voiced_parts = voice_chord(current_chord)
 
@@ -143,9 +161,33 @@ def audio_to_chords_and_melody(audio_file_path):
     f0, voiced_flag, voiced_probs = librosa.pyin(
         y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr)
 
+    def quantize_duration(q, resolution=16):
+        # Convert raw duration (quarter notes) into expressible MusicXML unit fractions
+        if q <= 0:
+            return 0.0
+        q = float(q)
+        quantized = round(q * resolution) / resolution
+        if quantized <= 0:
+            quantized = 1.0 / resolution
+        return quantized
+
     # Estimate tempo to help with duration
     onset_env = librosa.onset.onset_detect(y=y, sr=sr)
-    tempo_bpm, beats = librosa.beat.beat_track(onset_env=onset_env, sr=sr)
+
+    if len(onset_env) < 2:
+        tempo_bpm = 120.0
+        beats = np.array([], dtype=int)
+    else:
+        tempo_bpm, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+
+    # Ensure tempo is scalar float (not numpy array) to avoid unhashable duration errors
+    try:
+        tempo_bpm = float(tempo_bpm)
+    except Exception:
+        if hasattr(tempo_bpm, 'item'):
+            tempo_bpm = float(tempo_bpm.item())
+        else:
+            tempo_bpm = 120.0
 
     # Process melody: convert frequencies to MIDI, quantize
     melody_midi_pitches = []
@@ -172,7 +214,8 @@ def audio_to_chords_and_melody(audio_file_path):
                 duration_seconds = duration_frames * frame_length
 
                 # Convert seconds to music21 quarterLength based on estimated tempo
-                duration_quarter_length = (duration_seconds * tempo_bpm / 60.0)
+                duration_quarter_length = float(duration_seconds * tempo_bpm / 60.0)
+                duration_quarter_length = quantize_duration(duration_quarter_length, resolution=16)
 
                 if duration_quarter_length > 0:
                     new_note = note.Note(current_note_pitch)
@@ -186,7 +229,8 @@ def audio_to_chords_and_melody(audio_file_path):
             if current_note_pitch is not None: # End of a note
                 duration_frames = i - current_note_start_frame
                 duration_seconds = duration_frames * frame_length
-                duration_quarter_length = (duration_seconds * tempo_bpm / 60.0)
+                duration_quarter_length = float(duration_seconds * tempo_bpm / 60.0)
+                duration_quarter_length = quantize_duration(duration_quarter_length, resolution=16)
 
                 if duration_quarter_length > 0:
                     new_note = note.Note(current_note_pitch)
@@ -203,7 +247,8 @@ def audio_to_chords_and_melody(audio_file_path):
     if current_note_pitch is not None and current_note_start_frame is not None:
         duration_frames = len(f0) - current_note_start_frame
         duration_seconds = duration_frames * frame_length
-        duration_quarter_length = (duration_seconds * tempo_bpm / 60.0)
+        duration_quarter_length = float(duration_seconds * tempo_bpm / 60.0)
+        duration_quarter_length = quantize_duration(duration_quarter_length, resolution=16)
         if duration_quarter_length > 0:
             new_note = note.Note(current_note_pitch)
             new_note.duration.quarterLength = duration_quarter_length
@@ -220,7 +265,7 @@ def audio_to_chords_and_melody(audio_file_path):
     avg_chroma = np.mean(chroma, axis=1)
 
     # Find root note (highest chroma bin)
-    root_midi_class = np.argmax(avg_chroma)
+    root_midi_class = int(np.argmax(avg_chroma))
 
     chord_names = librosa.midi_to_note(root_midi_class)
 
