@@ -4,6 +4,7 @@ from pathlib import Path
 from music21 import stream, note, chord, tempo, clef, harmony, key, meter, metadata, duration
 import librosa
 import numpy as np
+from scipy.ndimage import median_filter
 from requests.exceptions import RequestsDependencyWarning
 
 # suppress known requests dependency-version warning when environment has newer urllib3/charset-normalizer
@@ -184,6 +185,147 @@ def transpose_to_vocal_range(mel_note):
     return n
 
 
+def separate_audio(input_file_path, output_dir='spleeter_output'):
+    """Separate vocals and accompaniment using spleeter (2 stems)."""
+    try:
+        from spleeter.separator import Separator
+    except ImportError:
+        raise ImportError('spleeter is required for source separation; run pip install spleeter')
+
+    output_base = Path(output_dir)
+    output_base.mkdir(parents=True, exist_ok=True)
+
+    separator = Separator('spleeter:2stems')
+    separator.separate_to_file(str(input_file_path), str(output_base))
+
+    source_dir = output_base / Path(input_file_path).stem
+    vocals_path = source_dir / 'vocals.wav'
+    accompaniment_path = source_dir / 'accompaniment.wav'
+
+    if not vocals_path.exists() or not accompaniment_path.exists():
+        raise FileNotFoundError('Spleeter output files not found.')
+
+    return str(vocals_path), str(accompaniment_path)
+
+
+def quantize_duration_simple(q):
+    """Force simpler rhythmic resolution: quarter/half/whole (minimal 16th spam)."""
+    if q <= 0:
+        return 0.0
+    q = float(q)
+    q = max(q, 0.25)
+    if q >= 3.5:
+        return round(q / 4.0) * 4.0
+    elif q >= 1.75:
+        return round(q / 2.0) * 2.0
+    else:
+        return round(q * 4.0) / 4.0
+
+
+def extract_melody(vocal_file_path, tempo_bpm=120):
+    """Extract melody line using librosa piptrack from isolated vocals."""
+    y, sr = librosa.load(vocal_file_path, sr=None)
+    pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+
+    hop_length = 512
+    frame_duration = hop_length / float(sr)
+    quarter_per_frame = frame_duration * tempo_bpm / 60.0
+
+    melody_notes = []
+    prev_pitch = None
+    prev_duration = 0.0
+
+    for t in range(pitches.shape[1]):
+        mag = np.max(magnitudes[:, t])
+        if mag < 0.01:
+            pitch_val = None
+        else:
+            idx = np.argmax(magnitudes[:, t])
+            pitch_hz = pitches[idx, t]
+            pitch_val = round(librosa.hz_to_midi(pitch_hz)) if pitch_hz > 0 else None
+
+        if pitch_val == prev_pitch:
+            prev_duration += quarter_per_frame
+        else:
+            if prev_pitch is not None:
+                dur = quantize_duration_simple(prev_duration)
+                if dur > 0:
+                    if prev_pitch is None:
+                        melody_notes.append(note.Rest(quarterLength=dur))
+                    else:
+                        n = note.Note(int(prev_pitch), quarterLength=dur)
+                        melody_notes.append(n)
+            prev_pitch = pitch_val
+            prev_duration = quarter_per_frame
+
+    if prev_pitch is not None:
+        dur = quantize_duration_simple(prev_duration)
+        if dur > 0:
+            if prev_pitch is None:
+                melody_notes.append(note.Rest(quarterLength=dur))
+            else:
+                melody_notes.append(note.Note(int(prev_pitch), quarterLength=dur))
+
+    # If melody is empty, fallback to one quarter note rest.
+    if not melody_notes:
+        melody_notes.append(note.Rest(quarterLength=1.0))
+
+    # Smooth rhythm so repeated adjacent notes are merged into longer values
+    melody_notes = smooth_rhythm(melody_notes)
+    return melody_notes
+
+
+def detect_chords(accompaniment_file_path, tempo_bpm=120):
+    """Detect chord roots from accompaniment and produce simple triads."""
+    y, sr = librosa.load(accompaniment_file_path, sr=None)
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+
+    # Smooth over time to reduce jumpy chord detection
+    chroma_smooth = median_filter(chroma, size=(1, 9))
+    root_trace = np.argmax(chroma_smooth, axis=0)
+
+    # Group frames into chord units (approx 1/4 note per block)
+    hop_length = 512
+    frame_time = hop_length / float(sr)
+    quarter_frames = max(1, int(round((60.0 / tempo_bpm) / frame_time)))
+
+    chord_list = []
+    n_frames = root_trace.shape[0]
+
+    for start in range(0, n_frames, quarter_frames):
+        end = min(n_frames, start + quarter_frames)
+        block_roots = root_trace[start:end]
+        block = chroma_smooth[:, start:end]
+        if block_roots.size == 0 or block.size == 0:
+            continue
+        root_pc = int(np.bincount(block_roots).argmax())
+
+        block_avg = np.mean(block, axis=1)
+        major_score = block_avg[root_pc] + block_avg[(root_pc + 4) % 12] + block_avg[(root_pc + 7) % 12]
+        minor_score = block_avg[root_pc] + block_avg[(root_pc + 3) % 12] + block_avg[(root_pc + 7) % 12]
+        mode = 'major' if major_score >= minor_score else 'minor'
+
+        if mode == 'major':
+            degrees = [0, 4, 7]
+        else:
+            degrees = [0, 3, 7]
+
+        chord_notes = [note.Note((root_pc + d) % 12 + 60) for d in degrees]
+        c = chord.Chord(chord_notes)
+        c.duration = duration.Duration(1.0)
+        chord_list.append(c)
+
+    if not chord_list:
+        chord_list = [chord.Chord([note.Note('C4'), note.Note('E4'), note.Note('G4')], quarterLength=1.0)]
+        root_pc = 0
+        mode = 'major'
+    else:
+        root_pc = int(chord_list[0].root().pitchClass)
+        mode = 'major'
+
+    return chord_list, root_pc, mode
+
+
 # Syllable palettes by voice role and section type
 SYLLABLES = {
     "intro": {
@@ -321,110 +463,205 @@ def voice_chord_smooth(ch, prev_voicing=None):
     }
 
 
+def apply_spacing_strategy(voiced, spacing='staggered'):
+    """Apply spacing rules to a voiced SATB chord."""
+    if not voiced:
+        return voiced
+
+    if spacing == 'staggered':
+        b = fit_to_range(voiced['B'].pitch.midi, *RANGES['bass'])
+        t = max(fit_to_range(voiced['T'].pitch.midi, *RANGES['tenor']), b + 5)
+        a = max(fit_to_range(voiced['A'].pitch.midi, *RANGES['alto']), t + 3)
+        s = max(fit_to_range(voiced['S'].pitch.midi, *RANGES['soprano']), a + 3)
+
+        voiced = {
+            'B': note.Note(b),
+            'T': note.Note(t),
+            'A': note.Note(a),
+            'S': note.Note(s)
+        }
+    elif spacing == 'block':
+        # Keep block spacing but respect ranges
+        voiced = {
+            'B': note.Note(fit_to_range(voiced['B'].pitch.midi, *RANGES['bass'])),
+            'T': note.Note(fit_to_range(voiced['T'].pitch.midi, *RANGES['tenor'])),
+            'A': note.Note(fit_to_range(voiced['A'].pitch.midi, *RANGES['alto'])),
+            'S': note.Note(fit_to_range(voiced['S'].pitch.midi, *RANGES['soprano']))
+        }
+    return voiced
+
+
+def interval(n1, n2):
+    return abs(n1 - n2) % 12
+
+
+def is_parallel(interval1, interval2):
+    return interval1 == interval2 and interval1 in (7, 12)
+
+
+def fix_voice_leading(prev_voicing, new_voicing):
+    """Avoid robotic parallel fifths/octaves by slight upper voice adjustment."""
+    if not prev_voicing or not new_voicing:
+        return new_voicing
+
+    result = {}
+    for v in ['S','A','T','B']:
+        if new_voicing.get(v):
+            result[v] = note.Note(new_voicing[v].pitch.midi)
+        else:
+            result[v] = None
+
+    for i, v1 in enumerate(['S', 'A', 'T', 'B']):
+        for v2 in ['A', 'T', 'B'][i:]:
+            if prev_voicing.get(v1) and prev_voicing.get(v2) and result.get(v1) and result.get(v2):
+                prev_int = interval(prev_voicing[v1].pitch.midi, prev_voicing[v2].pitch.midi)
+                new_int = interval(result[v1].pitch.midi, result[v2].pitch.midi)
+                if is_parallel(prev_int, new_int):
+                    result[v1].pitch.midi = fit_to_range(result[v1].pitch.midi + 1, *RANGES['soprano'])
+
+    return result
+
+
+def smooth_rhythm(note_sequence):
+    """Merge successive same notes/rests into longer durations."""
+    if not note_sequence:
+        return note_sequence
+
+    merged = [note_sequence[0]]
+    for item in note_sequence[1:]:
+        last = merged[-1]
+        same = False
+
+        if isinstance(last, note.Rest) and isinstance(item, note.Rest):
+            same = True
+        elif isinstance(last, note.Note) and isinstance(item, note.Note):
+            same = last.pitch.midi == item.pitch.midi
+
+        if same:
+            last.duration.quarterLength += item.duration.quarterLength
+        else:
+            merged.append(item)
+
+    return merged
+
+
 def arrange(chord_progression, melody_notes, title='Arrangr Acapella',
             key_signature=0, time_signature='4/4', tempo_bpm=120):
     """
-    Create professional SATB acapella arrangement with proper voice leading.
-    Solo line appears ONLY when melody is active (has pitch content).
-    SATB provides harmonic backup with appropriate syllables per section.
+    CLEAN SPARSE SATB arrangement.
+    Philosophy: Less but correct. Enforce discipline with intentional silence.
     """
+    
+    # SIMPLIFY: only sample every 4th melody note, rest are silence
+    simplified_melody = []
+    for i, n in enumerate(melody_notes):
+        if i % 4 == 0 and isinstance(n, note.Note) and n.pitch is not None:
+            simplified_melody.append(n)
+        else:
+            simplified_melody.append(note.Rest(quarterLength=1.0))
+    
+    # SIMPLIFY: extend chords to match melody length
+    if len(chord_progression) < len(simplified_melody):
+        repeat_factor = int(np.ceil(len(simplified_melody) / len(chord_progression))) if chord_progression else 1
+        if chord_progression:
+            simplified_chords = (chord_progression * repeat_factor)[:len(simplified_melody)]
+        else:
+            simplified_chords = [chord.Chord([note.Note('C4'), note.Note('E4'), note.Note('G4')], quarterLength=1.0)] * len(simplified_melody)
+    else:
+        simplified_chords = chord_progression[:len(simplified_melody)]
+    
+    # Ensure both lists match
+    total_events = max(len(simplified_melody), len(simplified_chords))
+    while len(simplified_melody) < total_events:
+        simplified_melody.append(note.Rest(quarterLength=1.0))
+    while len(simplified_chords) < total_events:
+        simplified_chords.append(chord.Chord([note.Note('C4'), note.Note('E4'), note.Note('G4')], quarterLength=1.0))
+    
+    # Build score
     score = stream.Score()
     score.metadata = metadata.Metadata()
     score.metadata.title = title
-
-    # Global markers
     score.insert(0, key.KeySignature(key_signature))
     score.insert(0, meter.TimeSignature(time_signature))
     score.insert(0, tempo.MetronomeMark(number=tempo_bpm))
 
     # Create parts
-    solo = stream.Part()
-    soprano = stream.Part()
-    alto = stream.Part()
-    tenor = stream.Part()
-    bass = stream.Part()
+    parts_dict = {
+        'Solo': stream.Part(),
+        'Soprano': stream.Part(),
+        'Alto': stream.Part(),
+        'Tenor': stream.Part(),
+        'Bass': stream.Part()
+    }
 
-    solo.partName = 'Solo'
-    soprano.partName = 'Soprano'
-    alto.partName = 'Alto'
-    tenor.partName = 'Tenor'
-    bass.partName = 'Bass'
-
-    # Assign clefs and metadata
-    for part, c in [(solo, clef.TrebleClef()), (soprano, clef.TrebleClef()),
-                    (alto, clef.TrebleClef()), (tenor, clef.TrebleClef()),
-                    (bass, clef.BassClef())]:
-        part.insert(0, c)
+    for part_name, part in parts_dict.items():
+        part.partName = part_name
+        clef_obj = clef.TrebleClef() if part_name != 'Bass' else clef.BassClef()
+        part.insert(0, clef_obj)
         part.insert(0, tempo.MetronomeMark(number=tempo_bpm))
         part.insert(0, key.KeySignature(key_signature))
         part.insert(0, meter.TimeSignature(time_signature))
 
-    # Estimate song duration and detect sections
-    total_events = max(len(melody_notes), len(chord_progression))
-    duration_seconds = sum([n.duration.quarterLength for n in melody_notes if n]) * (60 / tempo_bpm) if melody_notes else 30
-    sections = detect_song_sections(np.array([]), 22050, duration_seconds)
-    
-    # Map events to sections
-    measures_per_section = {}
-    cumulative = 0
-    for sec in sections:
-        for i in range(cumulative, cumulative + sec['measures']):
-            measures_per_section[i] = sec['name']
-        cumulative += sec['measures']
-
-    prev_voicing = None
-
+    # CLEAN SPARSE ARRANGEMENT LOGIC
     for i in range(total_events):
-        mel_note = melody_notes[i] if i < len(melody_notes) else None
-        current_chord = chord_progression[i] if i < len(chord_progression) else None
-        
-        # Determine section for this event
-        section_idx = i // 4  # Roughly 4 events per measure
-        section_name = measures_per_section.get(section_idx, "verse")
-        
-        # Check if melody has actual pitch content
-        has_melody = mel_note is not None and hasattr(mel_note, 'pitch') and mel_note.pitch is not None
-        
-        if has_melody:
-            event_duration = mel_note.duration.quarterLength
-        elif current_chord is not None:
-            event_duration = current_chord.duration.quarterLength
-        else:
-            event_duration = 1.0
+        mel_note = simplified_melody[i]
+        current_chord = simplified_chords[i]
 
-        # SOLO: Add only if melody is active (has pitch)
+        # Determine if this is a melody moment
+        has_melody = isinstance(mel_note, note.Note) and mel_note.pitch is not None
+
+        # Get chord root
+        if current_chord and hasattr(current_chord, 'root'):
+            try:
+                root_midi = int(current_chord.root().pitch.midi)
+            except:
+                root_midi = 60
+        else:
+            root_midi = 60
+
+        # SOLO: only sing when there's actual melody
         if has_melody:
             solo_note = transpose_to_vocal_range(mel_note)
-            solo_note.lyric = mel_note.lyric if hasattr(mel_note, 'lyric') and mel_note.lyric else 'ah'
-            solo.append(solo_note)
+            solo_note.lyric = 'ah'
+            parts_dict['Solo'].append(solo_note)
         else:
-            # Silence solo when no melody
-            solo.append(note.Rest(quarterLength=event_duration))
+            parts_dict['Solo'].append(note.Rest(quarterLength=1.0))
 
-        # SATB BACKUP: Voice the chord with proper voice leading
-        if current_chord is not None and current_chord.pitches:
-            voiced = voice_chord_smooth(current_chord, prev_voicing)
-            prev_voicing = voiced
-            
-            if voiced:
-                for voice_name, part in [('S', soprano), ('A', alto), ('T', tenor), ('B', bass)]:
-                    v = voiced[voice_name]
-                    v.duration = duration.Duration(event_duration)
-                    v.lyric = get_syllable(voice_name.lower(), section_name, i)
-                    part.append(v)
-            else:
-                for part in [soprano, alto, tenor, bass]:
-                    part.append(note.Rest(quarterLength=event_duration))
+        # SOPRANO: joins on strong beats (every 8 beats), mostly rests
+        if i % 8 == 0 and not has_melody:
+            s_note = note.Note(fit_to_range(root_midi + 7, *RANGES['soprano']), quarterLength=2.0)
+            s_note.lyric = 'oo'
+            parts_dict['Soprano'].append(s_note)
         else:
-            for part in [soprano, alto, tenor, bass]:
-                part.append(note.Rest(quarterLength=event_duration))
+            parts_dict['Soprano'].append(note.Rest(quarterLength=1.0))
 
-    # Insert parts in score (solo first)
-    score.insert(0, bass)
-    score.insert(0, tenor)
-    score.insert(0, alto)
-    score.insert(0, soprano)
-    score.insert(0, solo)
+        # ALTO: holds harmony on every 4 beats (third)
+        if i % 4 == 0:
+            a_note = note.Note(fit_to_range(root_midi + 4, *RANGES['alto']), quarterLength=2.0)
+            a_note.lyric = 'oo'
+            parts_dict['Alto'].append(a_note)
+        else:
+            parts_dict['Alto'].append(note.Rest(quarterLength=1.0))
+
+        # TENOR: often silent, only on strong chord changes (every 8 beats)
+        if i % 8 == 4:
+            t_note = note.Note(fit_to_range(root_midi, *RANGES['tenor']), quarterLength=2.0)
+            t_note.lyric = 'uh'
+            parts_dict['Tenor'].append(t_note)
+        else:
+            parts_dict['Tenor'].append(note.Rest(quarterLength=1.0))
+
+        # BASS: slow root movement (every 2 beats)
+        if i % 2 == 0:
+            b_note = note.Note(fit_to_range(root_midi - 12, *RANGES['bass']), quarterLength=2.0)
+            b_note.lyric = 'dum'
+            parts_dict['Bass'].append(b_note)
+        else:
+            parts_dict['Bass'].append(note.Rest(quarterLength=1.0))
+
+    # Add parts to score
+    for part_name in ['Bass', 'Tenor', 'Alto', 'Soprano', 'Solo']:
+        score.insert(0, parts_dict[part_name])
 
     return score
 
@@ -432,154 +669,48 @@ def arrange(chord_progression, melody_notes, title='Arrangr Acapella',
 # Audio Processing (MP3/WAV)
 # ===========================
 def audio_to_chords_and_melody(audio_file_path):
-    """Convert audio (wav or mp3) to chord progression and melody using librosa"""
+    """Convert audio (wav or mp3) to chord progression and melody using librosa + optional spleeter."""
     print(f"Analyzing audio file: {audio_file_path}")
-    y, sr = librosa.load(audio_file_path, sr=None)  # Load with original sampling rate
 
-    # Melody extraction using probabilistic YIN
-    f0, voiced_flag, voiced_probs = librosa.pyin(
-        y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr)
+    try:
+        vocals_file, accompaniment_file = separate_audio(audio_file_path)
+    except Exception as e:
+        print('Warning: source separation unavailable or failed, using full mix. Error:', e)
+        vocals_file, accompaniment_file = audio_file_path, audio_file_path
 
-    def quantize_duration(q, resolution=16):
-        # Convert raw duration (quarter notes) into expressible MusicXML unit fractions
-        if q <= 0:
-            return 0.0
-        q = float(q)
-        quantized = round(q * resolution) / resolution
-        if quantized <= 0:
-            quantized = 1.0 / resolution
-        return quantized
-
-    # Estimate tempo to help with duration
-    onset_env = librosa.onset.onset_detect(y=y, sr=sr)
-
-    if len(onset_env) < 2:
-        tempo_bpm = 120.0
-        beats = np.array([], dtype=int)
+    # Estimate tempo from accompaniment track
+    y_acc, sr_acc = librosa.load(accompaniment_file, sr=None)
+    onset_env = librosa.onset.onset_strength(y=y_acc, sr=sr_acc)
+    if len(onset_env) >= 2:
+        tempo_bpm, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr_acc)
     else:
-        tempo_bpm, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+        tempo_bpm, beats = 120.0, np.array([], dtype=int)
 
-    # Ensure tempo is scalar float (not numpy array) to avoid unhashable duration errors
     try:
         tempo_bpm = float(tempo_bpm)
     except Exception:
-        if hasattr(tempo_bpm, 'item'):
-            tempo_bpm = float(tempo_bpm.item())
-        else:
-            tempo_bpm = 120.0
+        tempo_bpm = 120.0
 
-    # Process melody: convert frequencies to MIDI, quantize
-    melody_midi_pitches = []
-    # librosa.pyin outputs f0 for each frame. We need to discretize this into notes.
-    # This is a simplified approach, a full note segmentation is complex.
+    # Melody (solo) from vocals
+    melody_list = extract_melody(vocals_file, tempo_bpm=tempo_bpm)
 
-    # Only consider voiced segments
-    # Iterate through frames, if voiced, add to current note candidate
-    current_note_pitch = None
-    current_note_start_frame = None
-    frame_length = len(y) / sr / len(f0) # Duration of each f0 frame in seconds
+    # Chords from accompaniment track
+    chord_list, root_pc, mode = detect_chords(accompaniment_file, tempo_bpm=tempo_bpm)
 
-    for i, freq in enumerate(f0):
-        if voiced_flag[i] and not np.isnan(freq) and freq > 0:
-            midi_pitch = librosa.hz_to_midi(freq)
-            rounded_pitch = round(midi_pitch)
+    # Align and trim chord/melody lists
+    if len(chord_list) < len(melody_list) and len(chord_list) > 0:
+        repeat_factor = int(np.ceil(len(melody_list) / len(chord_list)))
+        chord_list = (chord_list * repeat_factor)[:len(melody_list)]
+    elif len(chord_list) > len(melody_list):
+        chord_list = chord_list[:len(melody_list)]
 
-            if current_note_pitch is None: # Start of a new note
-                current_note_pitch = rounded_pitch
-                current_note_start_frame = i
-            elif current_note_pitch != rounded_pitch: # Pitch change, end current note, start new
-                # Add the previous note
-                duration_frames = i - current_note_start_frame
-                duration_seconds = duration_frames * frame_length
+    if not melody_list:
+        melody_list = [note.Rest(quarterLength=1.0)]
+    if not chord_list:
+        chord_list = [chord.Chord([note.Note('C4'), note.Note('E4'), note.Note('G4')], quarterLength=1.0)]
+        root_pc = 0
 
-                # Convert seconds to music21 quarterLength based on estimated tempo
-                duration_quarter_length = float(duration_seconds * tempo_bpm / 60.0)
-                duration_quarter_length = quantize_duration(duration_quarter_length, resolution=16)
-
-                if duration_quarter_length > 0:
-                    new_note = note.Note(current_note_pitch)
-                    new_note.duration.quarterLength = duration_quarter_length
-                    melody_midi_pitches.append(new_note)
-
-                # Start new note
-                current_note_pitch = rounded_pitch
-                current_note_start_frame = i
-        else: # Unvoiced segment or NaN
-            if current_note_pitch is not None: # End of a note
-                duration_frames = i - current_note_start_frame
-                duration_seconds = duration_frames * frame_length
-                duration_quarter_length = float(duration_seconds * tempo_bpm / 60.0)
-                duration_quarter_length = quantize_duration(duration_quarter_length, resolution=16)
-
-                if duration_quarter_length > 0:
-                    new_note = note.Note(current_note_pitch)
-                    new_note.duration.quarterLength = duration_quarter_length
-                    melody_midi_pitches.append(new_note)
-
-                current_note_pitch = None # Reset
-                current_note_start_frame = None
-
-            # Optionally add rests for unvoiced segments, but we'll simplify for now
-            # and let the arrangement match melody and chords.
-
-    # Add the last note if loop ends while a note is active
-    if current_note_pitch is not None and current_note_start_frame is not None:
-        duration_frames = len(f0) - current_note_start_frame
-        duration_seconds = duration_frames * frame_length
-        duration_quarter_length = float(duration_seconds * tempo_bpm / 60.0)
-        duration_quarter_length = quantize_duration(duration_quarter_length, resolution=16)
-        if duration_quarter_length > 0:
-            new_note = note.Note(current_note_pitch)
-            new_note.duration.quarterLength = duration_quarter_length
-            melody_midi_pitches.append(new_note)
-
-    melody_list = melody_midi_pitches if melody_midi_pitches else []  # Fallback
-
-    # Chord extraction: compute chroma and estimate a simple chord
-    # This provides chroma features, then we detect the most prominent root.
-    chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_chroma=12) # Chroma energy for each pitch class
-
-    # For a simple approach, we can average chroma over time to get overall key/chord
-    # A more advanced approach would involve chord recognition algorithms over time frames.
-    avg_chroma = np.mean(chroma, axis=1)
-
-    # Find root note (highest chroma bin)
-    root_midi_class = int(np.argmax(avg_chroma))
-    root_note_name = librosa.midi_to_note(root_midi_class)
-
-    # Simple key mode guess from relative strength of major/minor tertian chords (I vs vi)
-    # This is a heuristic; in practice we can refine with pitch class profile analysis.
-    major_score = avg_chroma[root_midi_class] + avg_chroma[(root_midi_class + 4) % 12] + avg_chroma[(root_midi_class + 7) % 12]
-    minor_score = avg_chroma[root_midi_class] + avg_chroma[(root_midi_class + 3) % 12] + avg_chroma[(root_midi_class + 7) % 12]
-    mode = 'major' if major_score >= minor_score else 'minor'
-
-    # Create chord progression aligned with melody notes:
-    # Each melody note is harmonized with a diatonic triad that contains its pitch class when possible.
-    chord_list_for_arrangement = []
-    key_root_pc = root_midi_class
-
-    for mel_note in melody_list:
-        if mel_note is None:
-            chord_list_for_arrangement.append(chord.Chord([]))
-            continue
-
-        melody_pc = mel_note.pitch.pitchClass
-        degree, chord_pcs = choose_diatonic_chord_note(melody_pc, key_root_pc, mode=mode)
-
-        # Build a chord from chosen pitch classes in a comfortable guitar/satb region.
-        chord_pitches = []
-        for pc in sorted(chord_pcs):
-            # Map pitch class to a stable octave around 3-4 for arrangement
-            midi_val = key_root_pc + ((pc - key_root_pc) % 12)
-            midi_val = (midi_val % 12) + 60  # around C4
-            chord_pitches.append(note.Note(midi_val))
-
-        chord_obj = chord.Chord(chord_pitches)
-        chord_obj.duration = mel_note.duration
-        chord_obj.closedPosition(inPlace=True)
-        chord_list_for_arrangement.append(chord_obj)
-
-    return chord_list_for_arrangement, melody_list, int(tempo_bpm), root_midi_class
+    return chord_list, melody_list, int(tempo_bpm), root_pc
 
 # ===========================
 # SIMPLE SATB ARRANGEMENT (per basic rules)
@@ -845,6 +976,125 @@ def create_professional_arrangement(melody_notes, chord_progression, title='Arra
     }
     
     return arrangement_json
+
+
+def stretch_notes(note_list, factor=2.0):
+    """Stretch durations in a music21 note/rest list."""
+    for n in note_list:
+        if isinstance(n, (note.Note, note.Rest)) and n.duration is not None:
+            n.duration.quarterLength = max(0.25, n.duration.quarterLength * factor)
+    return note_list
+
+
+def classical_style(score_or_arrangement):
+    """Apply classical-style texture to either a music21 score or arrangement dict."""
+    if isinstance(score_or_arrangement, stream.Score):
+        for part in score_or_arrangement.parts:
+            stretch_notes([n for n in part.recurse().notesAndRests], factor=1.8)
+        # Optionally set lyrics/syllables for each part
+        for part in score_or_arrangement.parts:
+            for n in part.recurse().notes:
+                if n.lyric is None or n.lyric.strip() == "":
+                    n.lyric = 'ah'
+        return score_or_arrangement
+
+    if isinstance(score_or_arrangement, dict):
+        score_or_arrangement['style'] = 'classical'
+        score_or_arrangement['vowels'] = 'ah/oo'
+        score_or_arrangement['dynamics'] = 'mp-mf'
+        return score_or_arrangement
+
+    return score_or_arrangement
+
+
+def contemporary_style(score_or_arrangement):
+    """Apply contemporary (Pentatonix-like) style texture."""
+    if isinstance(score_or_arrangement, stream.Score):
+        # Make bass more rhythmic by splitting long notes in bass part
+        bass_part = score_or_arrangement.parts['Bass'] if 'Bass' in score_or_arrangement.parts else None
+        if bass_part:
+            for n in list(bass_part.recurse().notesAndRests):
+                if isinstance(n, note.Note) and n.duration.quarterLength >= 1.0:
+                    # turn one long note into 2 staccato hits
+                    n.duration.quarterLength = n.duration.quarterLength / 2
+                    n.lyric = 'dum'
+            for part_name in ['Soprano', 'Alto', 'Tenor']:
+                prt = score_or_arrangement.parts[part_name] if part_name in score_or_arrangement.parts else None
+                if prt:
+                    for n in prt.recurse().notes:
+                        if n.lyric is None or n.lyric.strip() == '':
+                            n.lyric = np.random.choice(['doo', 'bap', 'tsk'])
+        return score_or_arrangement
+
+    if isinstance(score_or_arrangement, dict):
+        score_or_arrangement['style'] = 'contemporary'
+        score_or_arrangement['vowels'] = ['doo', 'bap', 'tsk']
+        score_or_arrangement['dynamics'] = 'mf-f'
+        return score_or_arrangement
+
+    return score_or_arrangement
+
+
+def apply_style(arrangement_or_score, style='classical'):
+    """Dispatch style transfer rule-set."""
+    if style == 'classical':
+        return classical_style(arrangement_or_score)
+    elif style == 'contemporary':
+        return contemporary_style(arrangement_or_score)
+    return arrangement_or_score
+
+
+def align_lyrics(melody_notes, lyrics):
+    """Align words to melody notes for realistic lyric attachment."""
+    words = [w for w in lyrics.strip().split() if w]
+    result = []
+    idx = 0
+
+    for n in melody_notes:
+        if isinstance(n, note.Rest) or n is None:
+            result.append(None)
+        else:
+            if idx < len(words):
+                result.append(words[idx])
+                idx += 1
+            else:
+                result.append('_')
+
+    return result
+
+
+def export_midi(score, output_path='output/choir.mid'):
+    """Export music21 score to MIDI using pretty_midi for choir soundfont path usage."""
+    try:
+        import pretty_midi
+    except ImportError:
+        raise ImportError('pretty_midi is required: pip install pretty_midi')
+
+    pm = pretty_midi.PrettyMIDI()
+    program = pretty_midi.instrument_name_to_program('Choir Aahs') if hasattr(pretty_midi, 'instrument_name_to_program') else 0
+
+    tempo_bpm = 120.0
+    mm = next(score.recurse().getElementsByClass(tempo.MetronomeMark), None)
+    if mm is not None and mm.number:
+        tempo_bpm = float(mm.number)
+
+    sec_per_quarter = 60.0 / tempo_bpm
+
+    for part in score.parts:
+        instr = pretty_midi.Instrument(program=program, name=part.partName)
+        time_cursor = 0.0
+        for element in part.recurse().notesAndRests:
+            dur_q = float(element.duration.quarterLength) if element.duration else 1.0
+            dur = dur_q * sec_per_quarter
+            if isinstance(element, note.Note):
+                pmn = pretty_midi.Note(velocity=80, pitch=int(element.pitch.midi), start=time_cursor, end=time_cursor + dur)
+                instr.notes.append(pmn)
+            time_cursor += dur
+        pm.instruments.append(instr)
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    pm.write(output_path)
+    return output_path
 
 
 def load_musicxml_and_arrange(musicxml_filepath):
