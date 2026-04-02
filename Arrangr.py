@@ -582,6 +582,311 @@ def audio_to_chords_and_melody(audio_file_path):
     return chord_list_for_arrangement, melody_list, int(tempo_bpm), root_midi_class
 
 # ===========================
+# SIMPLE SATB ARRANGEMENT (per basic rules)
+# ===========================
+def analyze_song_sections(total_measures):
+    """
+    Detect and structure song sections for smart arrangement decisions.
+    Returns list of section definitions with measures and arrangement strategy.
+    """
+    sections = []
+    
+    if total_measures <= 8:
+        # Short song: intro + main
+        sections = [
+            {"name": "intro", "measures": min(2, total_measures // 4), "texture": "thin"},
+            {"name": "main", "measures": total_measures - min(2, total_measures // 4), "texture": "full"}
+        ]
+    elif total_measures <= 32:
+        # Standard pop: intro + verse + chorus
+        intro_m = 2
+        verse_m = (total_measures - intro_m - 8) // 2
+        sections = [
+            {"name": "intro", "measures": intro_m, "texture": "thin"},
+            {"name": "verse", "measures": verse_m, "texture": "medium"},
+            {"name": "chorus", "measures": 8, "texture": "full"}
+        ]
+    else:
+        # Full song: intro + verse + chorus + verse + chorus + bridge + outro
+        intro_m = 4
+        verse_m = 8
+        chorus_m = 8
+        bridge_m = 4
+        outro_m = total_measures - (intro_m + 2*verse_m + 2*chorus_m + bridge_m)
+        outro_m = max(4, outro_m)
+        
+        sections = [
+            {"name": "intro", "measures": intro_m, "texture": "thin"},
+            {"name": "verse", "measures": verse_m, "texture": "medium"},
+            {"name": "chorus", "measures": chorus_m, "texture": "full"},
+            {"name": "verse", "measures": verse_m, "texture": "medium"},
+            {"name": "chorus", "measures": chorus_m, "texture": "full"},
+            {"name": "bridge", "measures": bridge_m, "texture": "medium"},
+            {"name": "outro", "measures": outro_m, "texture": "full"}
+        ]
+    
+    return sections
+
+
+def get_section_arrangement_strategy(section_name, texture, soloist_active):
+    """
+    Define how voices should behave in each section type.
+    Returns dict with voice activity and arrangement approach.
+    """
+    strategies = {
+        "intro": {
+            "thin": {
+                "voices": {"S": "rest", "A": "active", "T": "active", "B": "rest"},
+                "spacing": "staggered",
+                "rhythm": "half/whole notes",
+                "dynamics": "p",
+                "notes": "Light, intimate start with just middle voices sustained on 'oo'"
+            },
+            "medium": {
+                "voices": {"S": "active", "A": "active", "T": "active", "B": "rest"},
+                "spacing": "staggered",
+                "rhythm": "half/whole notes",
+                "dynamics": "mp",
+                "notes": "Build with three voices, Bass enters late or rests"
+            },
+            "full": {
+                "voices": {"S": "active", "A": "active", "T": "active", "B": "active"},
+                "spacing": "block",
+                "rhythm": "quarter/half notes",
+                "dynamics": "mf",
+                "notes": "Full SATB block chord foundation, steady and clean"
+            }
+        },
+        "verse": {
+            "thin": {
+                "voices": {"S": "rest", "A": "active", "T": "active", "B": "active"},
+                "spacing": "staggered",
+                "rhythm": "half/whole notes",
+                "dynamics": "mp",
+                "notes": "Soloist shines: choir sustains on 'oo', let melody breathe. Bass enters with half notes."
+            },
+            "medium": {
+                "voices": {"S": "active", "A": "active", "T": "active", "B": "active"},
+                "spacing": "staggered",
+                "rhythm": "quarter/half notes",
+                "dynamics": "mf",
+                "notes": "All voices active but at different rhythmic layers. S/A sustain while T/B track harmony."
+            },
+            "full": {
+                "voices": {"S": "active", "A": "active", "T": "active", "B": "active"},
+                "spacing": "block",
+                "rhythm": "quarter/half notes",
+                "dynamics": "f",
+                "notes": "SATB block chords under soloist, rhythmically unified but clean"
+            }
+        },
+        "chorus": {
+            "thin": {
+                "voices": {"S": "active", "A": "active", "T": "rest", "B": "rest"},
+                "spacing": "staggered",
+                "rhythm": "quarter notes",
+                "dynamics": "mf",
+                "notes": "Soprano + Alto harmony, light texture, lets soloist shine"
+            },
+            "medium": {
+                "voices": {"S": "active", "A": "active", "T": "active", "B": "rest"},
+                "spacing": "staggered",
+                "rhythm": "quarter/half notes",
+                "dynamics": "mf",
+                "notes": "Three-voice harmony, Tenor adds warmth, Bass rests to keep space for melody"
+            },
+            "full": {
+                "voices": {"S": "active", "A": "active", "T": "active", "B": "active"},
+                "spacing": "block",
+                "rhythm": "quarter/half notes",
+                "dynamics": "f",
+                "notes": "Full SATB, rhythmically unified, punchy and supportive"
+            }
+        },
+        "bridge": {
+            "thin": {
+                "voices": {"S": "rest", "A": "active", "T": "active", "B": "active"},
+                "spacing": "staggered",
+                "rhythm": "half notes",
+                "dynamics": "mp",
+                "notes": "Stripped down, vulnerable texture; focus on melody with minimal support"
+            },
+            "medium": {
+                "voices": {"S": "active", "A": "active", "T": "active", "B": "rest"},
+                "spacing": "staggered",
+                "rhythm": "half notes",
+                "dynamics": "mp",
+                "notes": "Three voices only, create contrast before final chorus. Sustained, sparse"
+            },
+            "full": {
+                "voices": {"S": "active", "A": "active", "T": "active", "B": "active"},
+                "spacing": "block",
+                "rhythm": "quarter/half notes",
+                "dynamics": "mf",
+                "notes": "Building section: full harmony to transition back to chorus energy"
+            }
+        },
+        "outro": {
+            "thin": {
+                "voices": {"S": "rest", "A": "active", "T": "rest", "B": "active"},
+                "spacing": "sparse",
+                "rhythm": "whole notes",
+                "dynamics": "p",
+                "notes": "Fade out: keep only outer voices for intimate close"
+            },
+            "medium": {
+                "voices": {"S": "rest", "A": "active", "T": "active", "B": "active"},
+                "spacing": "staggered",
+                "rhythm": "whole/half notes",
+                "dynamics": "p",
+                "notes": "Three voices diminish, sustained final chord, ritardando feel"
+            },
+            "full": {
+                "voices": {"S": "active", "A": "active", "T": "active", "B": "active"},
+                "spacing": "block",
+                "rhythm": "whole notes",
+                "dynamics": "p",
+                "notes": "Full SATB final chord held, serene conclusion"
+            }
+        }
+    }
+    
+    # If soloist is active, scale back choir slightly
+    strategy = strategies.get(section_name, strategies["verse"]).get(texture, strategies["verse"]["medium"]).copy()
+    
+    if soloist_active:
+        # When soloist is active, choir plays supporting role
+        if strategy["voices"]["S"] == "active":
+            strategy["dynamics"] = "mp" if strategy["dynamics"] == "mf" else "p"
+    
+    return strategy
+
+
+def create_professional_arrangement(melody_notes, chord_progression, title='Arrangement'):
+    """
+    Create a PROFESSIONAL, MUSICALLY INTELLIGENT SATB + SOLOIST arrangement.
+    
+    Key principles:
+    - Soloist carries the melody
+    - Choir provides intelligent, layered support
+    - Use space and silence
+    - Build texture across sections
+    - Think in phrases, not beats
+    
+    Returns JSON dict with complete arrangement metadata.
+    """
+    
+    # Estimate total measures
+    total_measures = max(len(melody_notes) if melody_notes else 0, len(chord_progression) if chord_progression else 0) // 4
+    total_measures = max(8, total_measures)  # Minimum 8 measures
+    
+    # Analyze structure
+    section_list = analyze_song_sections(total_measures)
+    
+    # Build arrangement sections
+    sections = []
+    measure_counter = 0
+    
+    for section_def in section_list:
+        section_name = section_def["name"]
+        section_measures = section_def["measures"]
+        base_texture = section_def["texture"]
+        
+        # Determine if soloist is active (mostly in verses/choruses)
+        soloist_active = section_name in ["verse", "chorus", "bridge", "outro"]
+        if section_name == "intro":
+            soloist_active = False
+        
+        # Get arrangement strategy for this section
+        strategy = get_section_arrangement_strategy(section_name, base_texture, soloist_active)
+        
+        # Create arrangement section
+        arrangement_section = {
+            "section_name": section_name,
+            "texture": base_texture,
+            "solo_active": soloist_active,
+            
+            "voices": strategy["voices"].copy(),
+            
+            "rhythm_style": strategy["rhythm"],
+            "spacing_strategy": strategy["spacing"],
+            "notes_density": "low" if base_texture == "thin" else ("medium" if base_texture == "medium" else "high"),
+            "dynamics": strategy["dynamics"],
+            
+            "voice_behavior": {
+                "S": "silence" if strategy["voices"]["S"] == "rest" else ("upper pad/harmony" if soloist_active else "melody line"),
+                "A": "sustained harmony on 'oo'" if strategy["voices"]["A"] == "active" else "silence",
+                "T": "inner harmony, slower rhythm" if strategy["voices"]["T"] == "active" else "silence",
+                "B": "root movement, long notes" if strategy["voices"]["B"] == "active" else "silence",
+                "solo": "main melody" if soloist_active else "silence"
+            },
+            
+            "arrangement_notes": strategy.get("notes", ""),
+            "measures": section_measures,
+            "measure_span": f"{measure_counter + 1}-{measure_counter + section_measures}"
+        }
+        
+        sections.append(arrangement_section)
+        measure_counter += section_measures
+    
+    # Return professional arrangement JSON
+    arrangement_json = {
+        "clefs": {
+            "S": "treble",
+            "A": "treble",
+            "T": "treble",
+            "B": "bass",
+            "solo": "treble"
+        },
+        "sections": sections,
+        "title": title,
+        "total_measures": total_measures,
+        "arrangement_philosophy": "Soloist-centric with intelligent choir support. Emphasizes space, phrase structure, and singability."
+    }
+    
+    return arrangement_json
+
+
+def load_musicxml_and_arrange(musicxml_filepath):
+    """
+    Load a MusicXML file, extract melody and chords, and create a professional arrangement.
+    Returns JSON arrangement with musical structure and voice strategy.
+    """
+    from music21 import converter
+    
+    # Load the MusicXML file
+    score = converter.parse(musicxml_filepath)
+    
+    # Get title from metadata if available
+    title = score.metadata.title if score.metadata and score.metadata.title else 'Arrangement'
+    
+    # Extract melody (usually from soprano or first melodic line)
+    melody_notes = []
+    chord_progression = []
+    
+    # Look for the first part that contains notes (likely melody)
+    for part in score.parts:
+        for element in part.flatten().notesAndRests:
+            if isinstance(element, note.Note):
+                melody_notes.append(element)
+            elif isinstance(element, chord.Chord):
+                chord_progression.append(element)
+    
+    # If no chords found, derive them from the melody
+    if not chord_progression and melody_notes:
+        # Create simple chords: just use the note itself as a triad
+        for mel_note in melody_notes:
+            midi_val = mel_note.pitch.midi
+            c = chord.Chord([note.Note(midi_val), note.Note(midi_val + 4), note.Note(midi_val + 7)])
+            c.duration = mel_note.duration
+            chord_progression.append(c)
+    
+    # Create and return the professional arrangement
+    arrangement = create_professional_arrangement(melody_notes, chord_progression, title)
+    return arrangement
+
+
+# ===========================
 # Main Application Logic
 # ===========================
 if __name__ == "__main__":
