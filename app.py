@@ -46,14 +46,17 @@ def upload_file():
             jobs[job_id]['status'] = 'Extracting chords and melody'
             jobs[job_id]['message'] = 'Extracting chords and melody...'
 
-            chord_prog, melody = audio_to_chords_and_melody(filepath)
+            chord_prog, melody, tempo_bpm, key_sig = audio_to_chords_and_melody(filepath)
             if not chord_prog or not melody:
                 raise ValueError('Could not extract musical information from audio')
 
             jobs[job_id]['status'] = 'Creating SATB arrangement'
             jobs[job_id]['message'] = 'Creating SATB arrangement...'
 
-            score = arrange(chord_prog, melody)
+            # Extract song title from filename
+            title = os.path.splitext(original_name)[0]
+            
+            score = arrange(chord_prog, melody, title=title, key_signature=key_sig, tempo_bpm=tempo_bpm)
             output_filename = os.path.splitext(original_name)[0] + '_arranged.musicxml'
             output_path = os.path.join(UPLOAD_FOLDER, output_filename)
             score.write('musicxml', fp=output_path)

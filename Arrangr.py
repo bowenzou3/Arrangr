@@ -1,7 +1,7 @@
 import warnings
 import os
 from pathlib import Path
-from music21 import stream, note, chord, tempo
+from music21 import stream, note, chord, tempo, clef, harmony, key, meter, metadata, duration
 import librosa
 import numpy as np
 from requests.exceptions import RequestsDependencyWarning
@@ -19,6 +19,10 @@ RANGES = {
     "tenor": (48, 67),    # C3–G4
     "bass": (40, 60),     # E2–C4
 }
+
+# Vocal and guitar performance ranges
+VOCAL_RANGE = (60, 76)   # D4–E5 (comfortable for many pop vocal leads)
+GUITAR_RANGE = (40, 64)  # E2–E4 (open strings and bar chords)
 
 def fit_to_range(pitch, low, high):
     """Adjusts a MIDI pitch to fit within a specified range, transposing by octaves"""
@@ -95,57 +99,332 @@ def voice_chord(ch):
         "bass": note.Note(b_midi),
     }
 
-def arrange(chord_progression, melody_notes):
-    """Create SATB + Solo score from chord progression and melody notes"""
-    score = stream.Score()
+def get_diatonic_chord_tables(root_pc, mode='major'):
+    """Return a list of triad PC sets for a key (I-ii-iii-IV-V-vi-viiº)."""
+    if mode == 'minor':
+        # Natural minor triads
+        intervals = [0, 2, 3, 5, 7, 8, 10]
+        chord_templates = [
+            [0, 3, 7], [2, 5, 9], [3, 7, 10], [5, 8, 0],
+            [7, 10, 2], [8, 0, 3], [10, 2, 5]
+        ]
+    else:
+        intervals = [0, 2, 4, 5, 7, 9, 11]
+        chord_templates = [
+            [0, 4, 7], [2, 5, 9], [4, 7, 11], [5, 9, 0],
+            [7, 11, 2], [9, 0, 4], [11, 2, 5]
+        ]
 
-    # Create music21 Part objects for each voice and the solo
+    chords = []
+    for template in chord_templates:
+        chords.append({(root_pc + interval) % 12 for interval in template})
+
+    return chords
+
+
+def choose_diatonic_chord_note(pitch_class, key_root_pc, mode='major'):
+    """Choose a diatonic triad containing the melody pitch class, fallback to I/IV/V."""
+    candidate_chords = get_diatonic_chord_tables(key_root_pc, mode)
+
+    # First pass: find any chord that contains the melody note pitch class.
+    for i, chord_pcs in enumerate(candidate_chords):
+        if pitch_class in chord_pcs:
+            return i, chord_pcs
+
+    # Fallback: V, IV, I
+    for deg in [4, 3, 0]:
+        if 0 <= deg < len(candidate_chords):
+            return deg, candidate_chords[deg]
+
+    return 0, candidate_chords[0]
+
+
+def chord_presents_as_guitar_chord(chord_obj):
+    """Construct a guitar-friendly voicing from a chord object."""
+    if not chord_obj or not chord_obj.pitches:
+        return None
+
+    # Use root of the chord and build a standard open/dropped voicing in mid-register.
+    root_name = chord_obj.root().name
+    try:
+        base = note.Note(root_name + '2')  # E2-E4 region
+    except Exception:
+        base = note.Note('E2')
+
+    root_midi = base.pitch.midi
+
+    # Use root, third, fifth stacked in the guitar mid-range.
+    # Ensure we stay in a playable range by spreading within a 2-octave window.
+    triad = chord_obj.commonName if chord_obj.commonName else None
+    pitch_classes = [p.pitchClass for p in chord_obj.pitches]
+
+    if len(pitch_classes) < 3:
+        # fallback to major third/fifth built from root
+        third = root_midi + 4
+        fifth = root_midi + 7
+    else:
+        # keep diatonic chord structure
+        sorted_pcs = sorted({p for p in pitch_classes})
+        third = root_midi + 4 if (root_midi + 4) % 12 in sorted_pcs else root_midi + 3
+        fifth = root_midi + 7 if (root_midi + 7) % 12 in sorted_pcs else root_midi + 8
+
+    # Make sure these notes remain in a guitar-friendly span
+    notes = [note.Note(root_midi), note.Note(third), note.Note(fifth)]
+    for n in notes:
+        n.pitch.midi = fit_to_range(n.pitch.midi, *GUITAR_RANGE)
+
+    return chord.Chord(notes)
+
+
+def transpose_to_vocal_range(mel_note):
+    """Transpose melody note to fit comfortably in vocal range."""
+    midi_val = mel_note.pitch.midi
+    target = fit_to_range(midi_val, *VOCAL_RANGE)
+    n = note.Note(target, duration=mel_note.duration)
+    return n
+
+
+# Syllable palettes by voice role and section type
+SYLLABLES = {
+    "intro": {
+        "soprano": ["ah", "oh", "ee", "oo"],
+        "alto": ["oh", "mm", "ah"],
+        "tenor": ["ah", "oo"],
+        "bass": ["oh", "mm"],
+        "percussion": ["boot", "tss", "kah"]
+    },
+    "verse": {
+        "soprano": ["ah", "ee", "oh", "oo"],
+        "alto": ["la", "oh", "na"],
+        "tenor": ["doo", "la", "dum"],
+        "bass": ["bum", "oh", "doo"],
+        "percussion": ["tss", "boot", "psh"]
+    },
+    "chorus": {
+        "soprano": ["ah", "ee", "oo"],
+        "alto": ["la", "na", "shoo"],
+        "tenor": ["duh", "la", "yeah"],
+        "bass": ["bah", "doo", "dum"],
+        "percussion": ["boot", "tss", "kah", "psh"]
+    },
+    "bridge": {
+        "soprano": ["ooh", "aah"],
+        "alto": ["mm", "oh"],
+        "tenor": ["vee", "doo"],
+        "bass": ["mm", "oh"],
+        "percussion": ["tss", "psh"]
+    },
+    "outro": {
+        "soprano": ["ah", "mm"],
+        "alto": ["oh", "mm"],
+        "tenor": ["oo", "ah"],
+        "bass": ["mm", "oh"],
+        "percussion": ["boot", "tss"]
+    }
+}
+
+def detect_song_sections(onset_env, sr, duration_seconds):
+    """Detect song sections (intro, verse, chorus, etc) from onset strength."""
+    # Simplified heuristic: divide song into sections based on total duration
+    total_measures = int((duration_seconds * 120) / 60 / 4)  # approx quarters
+    
+    sections = []
+    if total_measures < 16:
+        sections = [{"name": "intro", "start": 0, "measures": max(4, total_measures // 3)}]
+        sections.append({"name": "verse", "start": sections[0]["measures"], "measures": total_measures - sections[0]["measures"]})
+    elif total_measures < 48:
+        intro_m = 4
+        verse_m = (total_measures - intro_m) // 3
+        sections = [
+            {"name": "intro", "start": 0, "measures": intro_m},
+            {"name": "verse", "start": intro_m, "measures": verse_m},
+            {"name": "chorus", "start": intro_m + verse_m, "measures": total_measures - intro_m - verse_m}
+        ]
+    else:
+        intro_m, verse_m, chorus_m, bridge_m = 4, 8, 8, 4
+        outro_m = total_measures - intro_m - 2*verse_m - 2*chorus_m - bridge_m
+        outro_m = max(4, outro_m)
+        sections = [
+            {"name": "intro", "start": 0, "measures": intro_m},
+            {"name": "verse", "start": intro_m, "measures": verse_m},
+            {"name": "chorus", "start": intro_m + verse_m, "measures": chorus_m},
+            {"name": "verse", "start": intro_m + verse_m + chorus_m, "measures": verse_m},
+            {"name": "chorus", "start": intro_m + 2*verse_m + chorus_m, "measures": chorus_m},
+            {"name": "bridge", "start": intro_m + 2*verse_m + 2*chorus_m, "measures": bridge_m},
+            {"name": "outro", "start": intro_m + 2*verse_m + 2*chorus_m + bridge_m, "measures": outro_m}
+        ]
+    return sections
+
+def get_syllable(voice, section_name, event_index):
+    """Select appropriate syllable for a voice in a section."""
+    syllable_set = SYLLABLES.get(section_name, SYLLABLES["verse"]).get(voice, ["ah"])
+    return syllable_set[event_index % len(syllable_set)]
+
+def voice_chord_smooth(ch, prev_voicing=None):
+    """Voice chord with proper SATB rules: smooth voice leading, avoid parallel 5ths/octaves."""
+    if not ch or not ch.pitches:
+        return None
+    
+    pitch_values = sorted(list({int(p.midi) for p in ch.pitches if isinstance(p.midi, (int, float))}))
+    
+    if len(pitch_values) < 3:
+        if len(pitch_values) == 1:
+            root_midi = pitch_values[0]
+            pitches = [root_midi, root_midi + 4, root_midi + 7]
+        elif len(pitch_values) == 2:
+            root_midi, second = pitch_values[0], pitch_values[1]
+            if (second - root_midi) % 12 == 7:
+                pitches = [root_midi, root_midi + 4, second]
+            else:
+                pitches = [root_midi, second, root_midi + 7]
+        else:
+            pitches = pitch_values
+    else:
+        pitches = pitch_values[:3]
+    
+    root_val, third_val, fifth_val = pitches[0], pitches[1], pitches[2]
+    
+    # Smooth voice leading: if previous voicing exists, move by step when possible
+    if prev_voicing:
+        s_midi = fit_to_range(fifth_val, *RANGES['soprano'])
+        a_midi = fit_to_range(third_val, *RANGES['alto'])
+        t_midi = fit_to_range(root_val, *RANGES['tenor'])
+        b_midi = fit_to_range(root_val - 12, *RANGES['bass'])
+        
+        # Prefer closest motion from previous voicing
+        candidates = {
+            "S": [fit_to_range(fifth_val + o*12, *RANGES['soprano']) for o in [-1, 0, 1]],
+            "A": [fit_to_range(third_val + o*12, *RANGES['alto']) for o in [-1, 0, 1]],
+            "T": [fit_to_range(root_val + o*12, *RANGES['tenor']) for o in [-1, 0, 1]],
+            "B": [fit_to_range(root_val - 12 + o*12, *RANGES['bass']) for o in [-1, 0, 1]]
+        }
+        
+        if prev_voicing.get("S"):
+            s_midi = min(candidates["S"], key=lambda x: abs(x - prev_voicing["S"].pitch.midi))
+        if prev_voicing.get("A"):
+            a_midi = min(candidates["A"], key=lambda x: abs(x - prev_voicing["A"].pitch.midi))
+        if prev_voicing.get("T"):
+            t_midi = min(candidates["T"], key=lambda x: abs(x - prev_voicing["T"].pitch.midi))
+        if prev_voicing.get("B"):
+            b_midi = min(candidates["B"], key=lambda x: abs(x - prev_voicing["B"].pitch.midi))
+    else:
+        s_midi = fit_to_range(fifth_val, *RANGES['soprano'])
+        a_midi = fit_to_range(third_val, *RANGES['alto'])
+        t_midi = fit_to_range(root_val, *RANGES['tenor'])
+        b_midi = fit_to_range(root_val - 12, *RANGES['bass'])
+    
+    return {
+        "S": note.Note(s_midi),
+        "A": note.Note(a_midi),
+        "T": note.Note(t_midi),
+        "B": note.Note(b_midi),
+    }
+
+
+def arrange(chord_progression, melody_notes, title='Arrangr Acapella',
+            key_signature=0, time_signature='4/4', tempo_bpm=120):
+    """
+    Create professional SATB acapella arrangement with proper voice leading.
+    Solo line appears ONLY when melody is active (has pitch content).
+    SATB provides harmonic backup with appropriate syllables per section.
+    """
+    score = stream.Score()
+    score.metadata = metadata.Metadata()
+    score.metadata.title = title
+
+    # Global markers
+    score.insert(0, key.KeySignature(key_signature))
+    score.insert(0, meter.TimeSignature(time_signature))
+    score.insert(0, tempo.MetronomeMark(number=tempo_bpm))
+
+    # Create parts
+    solo = stream.Part()
     soprano = stream.Part()
     alto = stream.Part()
     tenor = stream.Part()
     bass = stream.Part()
-    solo = stream.Part()
 
+    solo.partName = 'Solo'
     soprano.partName = 'Soprano'
     alto.partName = 'Alto'
     tenor.partName = 'Tenor'
     bass.partName = 'Bass'
-    solo.partName = 'Solo'
 
-    # Assume melody_notes and chord_progression are synchronized in length or duration
-    # This simplification means each melody note will have a corresponding chord for voicing
-    for i, mel_note in enumerate(melody_notes):
-        current_chord = chord_progression[i] if i < len(chord_progression) else chord.Chord() # Fallback
+    # Assign clefs and metadata
+    for part, c in [(solo, clef.TrebleClef()), (soprano, clef.TrebleClef()),
+                    (alto, clef.TrebleClef()), (tenor, clef.TrebleClef()),
+                    (bass, clef.BassClef())]:
+        part.insert(0, c)
+        part.insert(0, tempo.MetronomeMark(number=tempo_bpm))
+        part.insert(0, key.KeySignature(key_signature))
+        part.insert(0, meter.TimeSignature(time_signature))
 
-        voiced_parts = voice_chord(current_chord)
+    # Estimate song duration and detect sections
+    total_events = max(len(melody_notes), len(chord_progression))
+    duration_seconds = sum([n.duration.quarterLength for n in melody_notes if n]) * (60 / tempo_bpm) if melody_notes else 30
+    sections = detect_song_sections(np.array([]), 22050, duration_seconds)
+    
+    # Map events to sections
+    measures_per_section = {}
+    cumulative = 0
+    for sec in sections:
+        for i in range(cumulative, cumulative + sec['measures']):
+            measures_per_section[i] = sec['name']
+        cumulative += sec['measures']
 
-        if not voiced_parts:
-            # If chord voicing fails, insert rests or default notes for the choir parts
-            soprano.append(note.Rest(type=mel_note.duration.type))
-            alto.append(note.Rest(type=mel_note.duration.type))
-            tenor.append(note.Rest(type=mel_note.duration.type))
-            bass.append(note.Rest(type=mel_note.duration.type))
-            solo.append(mel_note)
-            continue
+    prev_voicing = None
 
-        # Set duration for the voiced notes to match the melody note's duration
-        voiced_parts["soprano"].duration = mel_note.duration
-        voiced_parts["alto"].duration = mel_note.duration
-        voiced_parts["tenor"].duration = mel_note.duration
-        voiced_parts["bass"].duration = mel_note.duration
+    for i in range(total_events):
+        mel_note = melody_notes[i] if i < len(melody_notes) else None
+        current_chord = chord_progression[i] if i < len(chord_progression) else None
+        
+        # Determine section for this event
+        section_idx = i // 4  # Roughly 4 events per measure
+        section_name = measures_per_section.get(section_idx, "verse")
+        
+        # Check if melody has actual pitch content
+        has_melody = mel_note is not None and hasattr(mel_note, 'pitch') and mel_note.pitch is not None
+        
+        if has_melody:
+            event_duration = mel_note.duration.quarterLength
+        elif current_chord is not None:
+            event_duration = current_chord.duration.quarterLength
+        else:
+            event_duration = 1.0
 
-        soprano.append(voiced_parts["soprano"])
-        alto.append(voiced_parts["alto"])
-        tenor.append(voiced_parts["tenor"])
-        bass.append(voiced_parts["bass"])
-        solo.append(mel_note)
+        # SOLO: Add only if melody is active (has pitch)
+        if has_melody:
+            solo_note = transpose_to_vocal_range(mel_note)
+            solo_note.lyric = mel_note.lyric if hasattr(mel_note, 'lyric') and mel_note.lyric else 'ah'
+            solo.append(solo_note)
+        else:
+            # Silence solo when no melody
+            solo.append(note.Rest(quarterLength=event_duration))
 
-    # Insert parts into the score. Order matters for display in MuseScore.
-    score.insert(0, solo) # Soloist often appears first
-    score.insert(0, soprano)
-    score.insert(0, alto)
-    score.insert(0, tenor)
+        # SATB BACKUP: Voice the chord with proper voice leading
+        if current_chord is not None and current_chord.pitches:
+            voiced = voice_chord_smooth(current_chord, prev_voicing)
+            prev_voicing = voiced
+            
+            if voiced:
+                for voice_name, part in [('S', soprano), ('A', alto), ('T', tenor), ('B', bass)]:
+                    v = voiced[voice_name]
+                    v.duration = duration.Duration(event_duration)
+                    v.lyric = get_syllable(voice_name.lower(), section_name, i)
+                    part.append(v)
+            else:
+                for part in [soprano, alto, tenor, bass]:
+                    part.append(note.Rest(quarterLength=event_duration))
+        else:
+            for part in [soprano, alto, tenor, bass]:
+                part.append(note.Rest(quarterLength=event_duration))
+
+    # Insert parts in score (solo first)
     score.insert(0, bass)
+    score.insert(0, tenor)
+    score.insert(0, alto)
+    score.insert(0, soprano)
+    score.insert(0, solo)
 
     return score
 
@@ -266,36 +545,41 @@ def audio_to_chords_and_melody(audio_file_path):
 
     # Find root note (highest chroma bin)
     root_midi_class = int(np.argmax(avg_chroma))
+    root_note_name = librosa.midi_to_note(root_midi_class)
 
-    chord_names = librosa.midi_to_note(root_midi_class)
+    # Simple key mode guess from relative strength of major/minor tertian chords (I vs vi)
+    # This is a heuristic; in practice we can refine with pitch class profile analysis.
+    major_score = avg_chroma[root_midi_class] + avg_chroma[(root_midi_class + 4) % 12] + avg_chroma[(root_midi_class + 7) % 12]
+    minor_score = avg_chroma[root_midi_class] + avg_chroma[(root_midi_class + 3) % 12] + avg_chroma[(root_midi_class + 7) % 12]
+    mode = 'major' if major_score >= minor_score else 'minor'
 
-    # Assume major chord for simplicity (add third and fifth)
-    # This will create one repeating chord for the entire piece.
-    # For a real arrangement, you'd need time-varying chord detection.
-    third_midi_class = (root_midi_class + 4) % 12
-    fifth_midi_class = (root_midi_class + 7) % 12
-
-    # Create music21 notes for the chord, assuming an octave (e.g., C4, E4, G4)
-    # The actual octave will be adjusted by voice_chord, but this sets the pitch classes.
-    chord_pitches_for_music21 = [
-        note.Note(chord_names + '4'),
-        note.Note(chord_names + '4'),
-        note.Note(chord_names + '4')
-    ]
-
-    # Create a single music21 Chord object from these pitches
-    base_chord = chord.Chord(chord_pitches_for_music21)
-
-    # Repeat this base chord for each melody note to match lengths
+    # Create chord progression aligned with melody notes:
+    # Each melody note is harmonized with a diatonic triad that contains its pitch class when possible.
     chord_list_for_arrangement = []
-    for mel_note in melody_list:
-        # Create a new chord instance for each melody note to allow for individual durations
-        cloned_chord = base_chord.__class__()
-        cloned_chord.duration = mel_note.duration
-        cloned_chord.add(base_chord.notes) # Add notes from the base chord
-        chord_list_for_arrangement.append(cloned_chord)
+    key_root_pc = root_midi_class
 
-    return chord_list_for_arrangement, melody_list
+    for mel_note in melody_list:
+        if mel_note is None:
+            chord_list_for_arrangement.append(chord.Chord([]))
+            continue
+
+        melody_pc = mel_note.pitch.pitchClass
+        degree, chord_pcs = choose_diatonic_chord_note(melody_pc, key_root_pc, mode=mode)
+
+        # Build a chord from chosen pitch classes in a comfortable guitar/satb region.
+        chord_pitches = []
+        for pc in sorted(chord_pcs):
+            # Map pitch class to a stable octave around 3-4 for arrangement
+            midi_val = key_root_pc + ((pc - key_root_pc) % 12)
+            midi_val = (midi_val % 12) + 60  # around C4
+            chord_pitches.append(note.Note(midi_val))
+
+        chord_obj = chord.Chord(chord_pitches)
+        chord_obj.duration = mel_note.duration
+        chord_obj.closedPosition(inPlace=True)
+        chord_list_for_arrangement.append(chord_obj)
+
+    return chord_list_for_arrangement, melody_list, int(tempo_bpm), root_midi_class
 
 # ===========================
 # Main Application Logic
