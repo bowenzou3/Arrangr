@@ -548,120 +548,140 @@ def smooth_rhythm(note_sequence):
 def arrange(chord_progression, melody_notes, title='Arrangr Acapella',
             key_signature=0, time_signature='4/4', tempo_bpm=120):
     """
-    CLEAN SPARSE SATB arrangement.
-    Philosophy: Less but correct. Enforce discipline with intentional silence.
+    Create professional SATB acapella arrangement with proper voice leading.
+    Solo line appears ONLY when melody is active (has pitch content).
+    SATB provides harmonic backup with appropriate syllables per section.
     """
-    
-    # SIMPLIFY: only sample every 4th melody note, rest are silence
-    simplified_melody = []
-    for i, n in enumerate(melody_notes):
-        if i % 4 == 0 and isinstance(n, note.Note) and n.pitch is not None:
-            simplified_melody.append(n)
-        else:
-            simplified_melody.append(note.Rest(quarterLength=1.0))
-    
-    # SIMPLIFY: extend chords to match melody length
-    if len(chord_progression) < len(simplified_melody):
-        repeat_factor = int(np.ceil(len(simplified_melody) / len(chord_progression))) if chord_progression else 1
-        if chord_progression:
-            simplified_chords = (chord_progression * repeat_factor)[:len(simplified_melody)]
-        else:
-            simplified_chords = [chord.Chord([note.Note('C4'), note.Note('E4'), note.Note('G4')], quarterLength=1.0)] * len(simplified_melody)
-    else:
-        simplified_chords = chord_progression[:len(simplified_melody)]
-    
-    # Ensure both lists match
-    total_events = max(len(simplified_melody), len(simplified_chords))
-    while len(simplified_melody) < total_events:
-        simplified_melody.append(note.Rest(quarterLength=1.0))
-    while len(simplified_chords) < total_events:
-        simplified_chords.append(chord.Chord([note.Note('C4'), note.Note('E4'), note.Note('G4')], quarterLength=1.0))
-    
-    # Build score
     score = stream.Score()
     score.metadata = metadata.Metadata()
     score.metadata.title = title
+
+    # Global markers
     score.insert(0, key.KeySignature(key_signature))
     score.insert(0, meter.TimeSignature(time_signature))
     score.insert(0, tempo.MetronomeMark(number=tempo_bpm))
 
     # Create parts
-    parts_dict = {
-        'Solo': stream.Part(),
-        'Soprano': stream.Part(),
-        'Alto': stream.Part(),
-        'Tenor': stream.Part(),
-        'Bass': stream.Part()
-    }
+    solo = stream.Part()
+    soprano = stream.Part()
+    alto = stream.Part()
+    tenor = stream.Part()
+    bass = stream.Part()
 
-    for part_name, part in parts_dict.items():
-        part.partName = part_name
-        clef_obj = clef.TrebleClef() if part_name != 'Bass' else clef.BassClef()
-        part.insert(0, clef_obj)
+    solo.partName = 'Solo'
+    soprano.partName = 'Soprano'
+    alto.partName = 'Alto'
+    tenor.partName = 'Tenor'
+    bass.partName = 'Bass'
+
+    # Assign clefs and metadata
+    for part, c in [(solo, clef.TrebleClef()), (soprano, clef.TrebleClef()),
+                    (alto, clef.TrebleClef()), (tenor, clef.TrebleClef()),
+                    (bass, clef.BassClef())]:
+        part.insert(0, c)
         part.insert(0, tempo.MetronomeMark(number=tempo_bpm))
         part.insert(0, key.KeySignature(key_signature))
         part.insert(0, meter.TimeSignature(time_signature))
 
-    # CLEAN SPARSE ARRANGEMENT LOGIC
+    # Estimate song duration and detect sections
+    total_events = max(len(melody_notes), len(chord_progression))
+    duration_seconds = sum([n.duration.quarterLength for n in melody_notes if n]) * (60 / tempo_bpm) if melody_notes else 30
+    sections = analyze_song_sections(max(1, total_events // 4))
+    
+    # Map measures to section definitions for strategy-based voice activity
+    measures_per_section = {}
+    cumulative = 0
+    for sec in sections:
+        for m in range(cumulative, cumulative + sec['measures']):
+            measures_per_section[m] = sec
+        cumulative += sec['measures']
+
+    prev_voicing = None
+
     for i in range(total_events):
-        mel_note = simplified_melody[i]
-        current_chord = simplified_chords[i]
+        mel_note = melody_notes[i] if i < len(melody_notes) else None
+        current_chord = chord_progression[i] if i < len(chord_progression) else None
+        
+        # Determine section for this event
+        section_idx = i // 4  # Roughly 4 events per measure
+        section_def = measures_per_section.get(section_idx, sections[-1]) if measures_per_section else {'name': 'verse', 'texture': 'medium'}
+        section_name = section_def['name']
+        soloist_active = section_name in ['verse', 'chorus', 'bridge', 'outro']
+        strategy = get_section_arrangement_strategy(section_name, section_def.get('texture', 'medium'), soloist_active)
 
-        # Determine if this is a melody moment
-        has_melody = isinstance(mel_note, note.Note) and mel_note.pitch is not None
+        voice_active = {
+            'S': strategy['voices'].get('S', 'active') == 'active',
+            'A': strategy['voices'].get('A', 'active') == 'active',
+            'T': strategy['voices'].get('T', 'active') == 'active',
+            'B': strategy['voices'].get('B', 'active') == 'active'
+        }
 
-        # Get chord root
-        if current_chord and hasattr(current_chord, 'root'):
-            try:
-                root_midi = int(current_chord.root().pitch.midi)
-            except:
-                root_midi = 60
+        # Check if melody has actual pitch content
+        has_melody = mel_note is not None and hasattr(mel_note, 'pitch') and mel_note.pitch is not None
+        
+        if has_melody:
+            event_duration = round(mel_note.duration.quarterLength * 4) / 4
+            event_duration = max(event_duration, 0.25)
+        elif current_chord is not None and hasattr(current_chord, 'duration'):
+            event_duration = round(current_chord.duration.quarterLength * 4) / 4
+            event_duration = max(event_duration, 0.25)
         else:
-            root_midi = 60
+            event_duration = 1.0
 
-        # SOLO: only sing when there's actual melody
+        # SOLO: Add only if melody is active (has pitch)
         if has_melody:
             solo_note = transpose_to_vocal_range(mel_note)
-            solo_note.lyric = 'ah'
-            parts_dict['Solo'].append(solo_note)
+            solo_note.lyric = mel_note.lyric if hasattr(mel_note, 'lyric') and mel_note.lyric else 'ah'
+            solo.append(solo_note)
         else:
-            parts_dict['Solo'].append(note.Rest(quarterLength=1.0))
+            solo.append(note.Rest(quarterLength=event_duration))
 
-        # SOPRANO: joins on strong beats (every 8 beats), mostly rests
-        if i % 8 == 0 and not has_melody:
-            s_note = note.Note(fit_to_range(root_midi + 7, *RANGES['soprano']), quarterLength=2.0)
-            s_note.lyric = 'oo'
-            parts_dict['Soprano'].append(s_note)
+        # SATB BACKUP: discretized, sparse, phrase-aware voicing
+        if current_chord is not None and hasattr(current_chord, 'pitches') and current_chord.pitches:
+            base_voicing = voice_chord_smooth(current_chord, prev_voicing)
+            base_voicing = apply_spacing_strategy(base_voicing, strategy.get('spacing', 'staggered'))
+
+            controlled = {"S": None, "A": None, "T": None, "B": None}
+
+            if has_melody:
+                # Soft choir support during solo
+                if i % 4 == 0:
+                    controlled['A'] = base_voicing.get('A')
+                if i % 2 == 0:
+                    controlled['B'] = base_voicing.get('B')
+            else:
+                # Choir section (no solo) with structured entry
+                root_midi = current_chord.root().pitch.midi if current_chord.root() else (base_voicing['T'].pitch.midi if base_voicing and base_voicing.get('T') else 60)
+                controlled['S'] = note.Note(fit_to_range(root_midi + 7, *RANGES['soprano']))
+                controlled['A'] = note.Note(fit_to_range(root_midi + 4, *RANGES['alto'])) if i % 2 == 0 else None
+                controlled['T'] = note.Note(fit_to_range(root_midi, *RANGES['tenor']))
+                controlled['B'] = note.Note(fit_to_range(root_midi - 12, *RANGES['bass']))
+
+            controlled = fix_voice_leading(prev_voicing, controlled)
+            prev_voicing = controlled
+
+            for voice_name, part in [('S', soprano), ('A', alto), ('T', tenor), ('B', bass)]:
+                if not voice_active.get(voice_name, True):
+                    part.append(note.Rest(quarterLength=event_duration))
+                    continue
+
+                vnote = controlled.get(voice_name)
+                if vnote is None:
+                    part.append(note.Rest(quarterLength=event_duration))
+                else:
+                    vnote.duration = duration.Duration(event_duration)
+                    vnote.lyric = get_syllable({'S':'soprano','A':'alto','T':'tenor','B':'bass'}[voice_name], section_name, i)
+                    part.append(vnote)
         else:
-            parts_dict['Soprano'].append(note.Rest(quarterLength=1.0))
+            for part in [soprano, alto, tenor, bass]:
+                part.append(note.Rest(quarterLength=event_duration))
 
-        # ALTO: holds harmony on every 4 beats (third)
-        if i % 4 == 0:
-            a_note = note.Note(fit_to_range(root_midi + 4, *RANGES['alto']), quarterLength=2.0)
-            a_note.lyric = 'oo'
-            parts_dict['Alto'].append(a_note)
-        else:
-            parts_dict['Alto'].append(note.Rest(quarterLength=1.0))
-
-        # TENOR: often silent, only on strong chord changes (every 8 beats)
-        if i % 8 == 4:
-            t_note = note.Note(fit_to_range(root_midi, *RANGES['tenor']), quarterLength=2.0)
-            t_note.lyric = 'uh'
-            parts_dict['Tenor'].append(t_note)
-        else:
-            parts_dict['Tenor'].append(note.Rest(quarterLength=1.0))
-
-        # BASS: slow root movement (every 2 beats)
-        if i % 2 == 0:
-            b_note = note.Note(fit_to_range(root_midi - 12, *RANGES['bass']), quarterLength=2.0)
-            b_note.lyric = 'dum'
-            parts_dict['Bass'].append(b_note)
-        else:
-            parts_dict['Bass'].append(note.Rest(quarterLength=1.0))
-
-    # Add parts to score
-    for part_name in ['Bass', 'Tenor', 'Alto', 'Soprano', 'Solo']:
-        score.insert(0, parts_dict[part_name])
+    # Insert parts in score (solo first)
+    score.insert(0, bass)
+    score.insert(0, tenor)
+    score.insert(0, alto)
+    score.insert(0, soprano)
+    score.insert(0, solo)
 
     return score
 
@@ -1095,6 +1115,491 @@ def export_midi(score, output_path='output/choir.mid'):
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     pm.write(output_path)
     return output_path
+
+
+# ===========================================================================
+# MP3 → Simple SATB + Soloist A Cappella Arrangement Pipeline
+# ===========================================================================
+# Rules:
+# - Soloist = melody only
+# - SATB = sustained harmony (whole/half notes only)
+# - Bass = root notes, bass clef
+# - Syllables: S/A→"oo"/"ah", T→"oh", B→"doo"/"dum", Solo→lyrics or "ah"
+
+# ---------------------------------------------------------------------------
+# Voice ranges (MIDI note numbers) for the MP3 pipeline
+# ---------------------------------------------------------------------------
+VOICE_RANGES = {
+    "solo": (60, 84),   # C4–C6  (soprano soloist)
+    "S":    (60, 81),   # C4–A5
+    "A":    (53, 69),   # F3–A4
+    "T":    (48, 67),   # C3–G4
+    "B":    (40, 60),   # E2–C4
+}
+
+# Chord-tone voicing templates per quality (semitone offsets from root)
+CHORD_VOICINGS = {
+    "maj":  [0, 4, 7],
+    "min":  [0, 3, 7],
+    "dom7": [0, 4, 7, 10],
+    "maj7": [0, 4, 7, 11],
+    "min7": [0, 3, 7, 10],
+    "dim":  [0, 3, 6],
+    "aug":  [0, 4, 8],
+}
+
+# Simple per-voice syllable defaults for the MP3 pipeline
+SATB_SYLLABLES = {
+    "solo": "ah",
+    "S":    "oo",
+    "A":    "ah",
+    "T":    "oh",
+    "B":    "doo",
+}
+
+
+# ---------------------------------------------------------------------------
+# MP3 Pipeline Step 1 — Load Audio
+# ---------------------------------------------------------------------------
+def load_audio(path: str, sr: int = 22050):
+    """Load MP3/WAV; return (y, sr)."""
+    y, sr = librosa.load(path, sr=sr, mono=True)
+    return y, sr
+
+
+# ---------------------------------------------------------------------------
+# MP3 Pipeline Step 2 — Extract Tempo + Beat Grid
+# ---------------------------------------------------------------------------
+def extract_tempo_beats(y: np.ndarray, sr: int):
+    """Return (bpm_float, beat_times_array)."""
+    tempo_est, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units="frames")
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+    bpm = float(np.round(tempo_est, 1))
+    return bpm, beat_times
+
+
+# ---------------------------------------------------------------------------
+# MP3 Pipeline Step 3 — Extract Melody via pyin (quantised to beats)
+# ---------------------------------------------------------------------------
+def pyin_extract_melody(y: np.ndarray, sr: int, beat_times: np.ndarray) -> list:
+    """
+    Use librosa pyin to track F0 and quantise to beat grid.
+    Returns list of {beat_index, midi_pitch (or None), duration_beats}.
+    """
+    f0, voiced_flag, voiced_probs = librosa.pyin(
+        y,
+        fmin=librosa.note_to_hz("C3"),
+        fmax=librosa.note_to_hz("C6"),
+        sr=sr,
+    )
+    times = librosa.times_like(f0, sr=sr)
+
+    melody_beats = []
+    for i, bt in enumerate(beat_times):
+        t_start = bt
+        t_end   = beat_times[i + 1] if i + 1 < len(beat_times) else bt + 0.5
+
+        mask = (times >= t_start) & (times < t_end) & voiced_flag
+        if mask.sum() > 0:
+            median_f0 = float(np.median(f0[mask]))
+            midi = int(np.round(librosa.hz_to_midi(median_f0)))
+            midi = int(np.clip(midi, *VOICE_RANGES["solo"]))
+        else:
+            midi = None  # rest
+
+        melody_beats.append({"beat": i, "midi": midi})
+
+    return melody_beats
+
+
+# ---------------------------------------------------------------------------
+# MP3 Pipeline Step 4 — Detect Chords via chromagram (one per measure)
+# ---------------------------------------------------------------------------
+def chromagram_detect_chords(y: np.ndarray, sr: int, beat_times: np.ndarray,
+                              beats_per_measure: int = 4) -> list:
+    """
+    Chromagram → one chord label per measure.
+    Returns list of {measure, root_midi, quality, pitches}.
+    """
+    hop_length = 512
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+    frame_times = librosa.frames_to_time(np.arange(chroma.shape[1]),
+                                          sr=sr, hop_length=hop_length)
+
+    num_measures = max(1, len(beat_times) // beats_per_measure)
+    chords_out   = []
+
+    chord_templates = {
+        "maj":  np.array([1,0,0,0,1,0,0,1,0,0,0,0], dtype=float),
+        "min":  np.array([1,0,0,1,0,0,0,1,0,0,0,0], dtype=float),
+        "dom7": np.array([1,0,0,0,1,0,0,1,0,0,1,0], dtype=float),
+        "maj7": np.array([1,0,0,0,1,0,0,1,0,0,0,1], dtype=float),
+        "min7": np.array([1,0,0,1,0,0,0,1,0,0,1,0], dtype=float),
+    }
+    note_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+
+    for m in range(num_measures):
+        b_start = m * beats_per_measure
+        b_end   = min(b_start + beats_per_measure, len(beat_times))
+
+        t_start = beat_times[b_start]
+        t_end   = beat_times[b_end - 1] + 0.01
+
+        mask = (frame_times >= t_start) & (frame_times < t_end)
+        if mask.sum() == 0:
+            chords_out.append({"measure": m, "root_midi": 48,
+                                "root_name": "C", "quality": "maj",
+                                "pitches": [48, 52, 55]})
+            continue
+
+        mean_chroma = chroma[:, mask].mean(axis=1)
+        mean_chroma /= (mean_chroma.max() + 1e-9)
+
+        best_score  = -1
+        best_root   = 0
+        best_qual   = "maj"
+
+        for root in range(12):
+            rotated = np.roll(mean_chroma, -root)
+            for qual, tmpl in chord_templates.items():
+                score = float(np.dot(rotated, tmpl))
+                if score > best_score:
+                    best_score = score
+                    best_root  = root
+                    best_qual  = qual
+
+        offsets   = CHORD_VOICINGS.get(best_qual, [0, 4, 7])
+        root_midi = 48 + best_root          # root anchored in octave 3
+        pitches   = [(root_midi + o) for o in offsets]
+
+        chords_out.append({
+            "measure":    m,
+            "root_midi":  root_midi,
+            "root_name":  note_names[best_root],
+            "quality":    best_qual,
+            "pitches":    pitches,
+        })
+
+    return chords_out
+
+
+# ---------------------------------------------------------------------------
+# MP3 Pipeline Step 5 — Simplify Rhythm → whole / half notes only
+# ---------------------------------------------------------------------------
+def beat_simplify_rhythm(melody_beats: list,
+                         beats_per_measure: int = 4) -> list:
+    """
+    Collapse consecutive same-pitch beats into whole (4) or half (2) notes.
+    Returns list of {start_beat, midi, duration_beats}.
+    """
+    if not melody_beats:
+        return []
+
+    simplified = []
+    i = 0
+    while i < len(melody_beats):
+        current_midi = melody_beats[i]["midi"]
+        run = 1
+        while (i + run < len(melody_beats) and
+               melody_beats[i + run]["midi"] == current_midi and
+               run < beats_per_measure):
+            run += 1
+
+        dur = 4 if run >= 3 else 2
+
+        simplified.append({
+            "start_beat":     melody_beats[i]["beat"],
+            "midi":           current_midi,
+            "duration_beats": dur,
+        })
+        i += run
+
+    return simplified
+
+
+# ---------------------------------------------------------------------------
+# MP3 Pipeline Step 6 — Assign SATB Voices
+# ---------------------------------------------------------------------------
+def _fit_to_range(midi: int, lo: int, hi: int) -> int:
+    """Octave-shift midi into [lo, hi]."""
+    while midi < lo:
+        midi += 12
+    while midi > hi:
+        midi -= 12
+    return int(np.clip(midi, lo, hi))
+
+
+def _closest_in_range(pitches: list, lo: int, hi: int,
+                       prefer: str = "mid") -> int:
+    """Pick chord tone (octave-adjusted) closest to range midpoint."""
+    candidates = list({_fit_to_range(p, lo, hi) for p in pitches})
+    if not candidates:
+        return (lo + hi) // 2
+    mid = (lo + hi) // 2
+    if prefer == "high":
+        return max(candidates)
+    if prefer == "low":
+        return min(candidates)
+    return min(candidates, key=lambda x: abs(x - mid))
+
+
+def assign_satb(simplified_melody: list,
+                chords: list,
+                beats_per_measure: int = 4) -> dict:
+    """
+    Distribute melody + chord data across Solo/S/A/T/B parts.
+    Returns dict with keys solo/S/A/T/B, each a list of
+    {start_beat, midi (None=rest), duration_beats}.
+    """
+    parts = {v: [] for v in ("solo", "S", "A", "T", "B")}
+
+    if simplified_melody:
+        last = simplified_melody[-1]
+        total_beats = last["start_beat"] + last["duration_beats"]
+    else:
+        total_beats = len(chords) * beats_per_measure
+
+    chord_map = {c["measure"]: c for c in chords}
+
+    # Solo line
+    for seg in simplified_melody:
+        parts["solo"].append({
+            "start_beat":     seg["start_beat"],
+            "midi":           seg["midi"],
+            "duration_beats": seg["duration_beats"],
+        })
+
+    num_measures = (total_beats + beats_per_measure - 1) // beats_per_measure
+
+    for m in range(num_measures):
+        beat_start = m * beats_per_measure
+        c = chord_map.get(m, {"pitches": [48, 52, 55, 59], "root_midi": 48})
+        pitches = c["pitches"]
+        root    = c["root_midi"]
+
+        solo_singing = any(
+            seg["midi"] is not None and
+            beat_start < seg["start_beat"] + seg["duration_beats"] and
+            seg["start_beat"] < beat_start + beats_per_measure
+            for seg in simplified_melody
+        )
+
+        dur = beats_per_measure  # whole note per measure
+
+        if solo_singing:
+            # Soprano rests; A/T/B sustain softly
+            parts["S"].append({"start_beat": beat_start, "midi": None, "duration_beats": dur})
+            parts["A"].append({"start_beat": beat_start,
+                                "midi": _closest_in_range(pitches, *VOICE_RANGES["A"]),
+                                "duration_beats": dur})
+            parts["T"].append({"start_beat": beat_start,
+                                "midi": _closest_in_range(pitches, *VOICE_RANGES["T"]),
+                                "duration_beats": dur})
+            parts["B"].append({"start_beat": beat_start,
+                                "midi": _fit_to_range(root, *VOICE_RANGES["B"]),
+                                "duration_beats": dur})
+        else:
+            # Full SATB carries chord when solo rests
+            parts["S"].append({"start_beat": beat_start,
+                                "midi": _closest_in_range(pitches, *VOICE_RANGES["S"], prefer="high"),
+                                "duration_beats": dur})
+            parts["A"].append({"start_beat": beat_start,
+                                "midi": _closest_in_range(pitches, *VOICE_RANGES["A"]),
+                                "duration_beats": dur})
+            parts["T"].append({"start_beat": beat_start,
+                                "midi": _closest_in_range(pitches, *VOICE_RANGES["T"]),
+                                "duration_beats": dur})
+            parts["B"].append({"start_beat": beat_start,
+                                "midi": _fit_to_range(root, *VOICE_RANGES["B"]),
+                                "duration_beats": dur})
+            parts["solo"].append({"start_beat": beat_start, "midi": None, "duration_beats": dur})
+
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# MP3 Pipeline Step 7 — Assign Syllables
+# ---------------------------------------------------------------------------
+def assign_syllables_satb(parts: dict, lyrics=None) -> dict:
+    """
+    Build syllable map for all voices.
+    Solo receives lyrics list (or "ah"). S/A→oo/ah, T→oh, B→doo/dum alternating.
+    """
+    syllable_map = {
+        "solo": lyrics if lyrics else "ah",
+        "S":    "oo",
+        "A":    "ah",
+        "T":    "oh",
+        "B":    "doo",
+    }
+
+    # Alternate bass syllables for naturalness
+    b_syllables = []
+    for i, seg in enumerate(parts.get("B", [])):
+        if seg["midi"] is None:
+            b_syllables.append(None)
+        else:
+            b_syllables.append("doo" if i % 2 == 0 else "dum")
+    syllable_map["B_sequence"] = b_syllables
+
+    return syllable_map
+
+
+# ---------------------------------------------------------------------------
+# MP3 Pipeline Step 8 — Build music21 Score
+# ---------------------------------------------------------------------------
+def build_score(parts: dict, syllables: dict, bpm: float,
+                beats_per_measure: int = 4):
+    """Assemble a music21 Score with Solo + SATB parts."""
+    from music21 import stream as m21stream, note as m21note, meter, tempo as m21tempo
+    from music21 import clef as m21clef, metadata as m21meta
+
+    sc = m21stream.Score()
+    sc.metadata = m21meta.Metadata()
+    sc.metadata.title = "A Cappella Arrangement"
+
+    voice_order = ["solo", "S", "A", "T", "B"]
+    voice_names = {
+        "solo": "Soloist",
+        "S":    "Soprano",
+        "A":    "Alto",
+        "T":    "Tenor",
+        "B":    "Bass",
+    }
+    voice_clefs = {
+        "solo": m21clef.TrebleClef(),
+        "S":    m21clef.TrebleClef(),
+        "A":    m21clef.TrebleClef(),
+        "T":    m21clef.TrebleClef(),
+        "B":    m21clef.BassClef(),
+    }
+
+    mm = m21tempo.MetronomeMark(number=bpm)
+
+    for v in voice_order:
+        part = m21stream.Part()
+        part.id       = v
+        part.partName = voice_names[v]
+        part.append(voice_clefs[v])
+        part.append(meter.TimeSignature(f"{beats_per_measure}/4"))
+        part.append(mm)
+
+        segs = parts.get(v, [])
+        syll = syllables.get(v, "ah")
+
+        for seg in segs:
+            dur_type = "whole" if seg["duration_beats"] == 4 else "half"
+
+            if seg["midi"] is None:
+                n = m21note.Rest()
+                n.duration.type = dur_type
+            else:
+                n = m21note.Note(seg["midi"])
+                n.duration.type = dur_type
+                if isinstance(syll, list) and len(syll) > 0:
+                    n.lyric = syll[0]
+                elif isinstance(syll, str):
+                    n.lyric = syll
+
+            part.append(n)
+
+        sc.append(part)
+
+    return sc
+
+
+# ---------------------------------------------------------------------------
+# MP3 → MusicXML Full Pipeline
+# ---------------------------------------------------------------------------
+def arrange_mp3(mp3_path: str,
+                output_json: str = "arrangement.json",
+                output_xml:  str = "arrangement.xml",
+                lyrics=None) -> dict:
+    """
+    Full pipeline: MP3 → SATB + Soloist arrangement saved as JSON + MusicXML.
+
+    Steps:
+      1. Load audio
+      2. Extract tempo + beat grid
+      3. Extract melody (pyin)
+      4. Detect chords (chromagram)
+      5. Simplify rhythm to half/whole notes
+      6. Assign SATB voices
+      7. Assign syllables
+      8. Build and save score
+    """
+    import json as _json
+
+    print(f"[1/7] Loading audio: {mp3_path}")
+    y, sr = load_audio(mp3_path)
+
+    print("[2/7] Extracting tempo + beats …")
+    bpm, beat_times = extract_tempo_beats(y, sr)
+    beats_per_measure = 4
+    print(f"      BPM={bpm}, beats={len(beat_times)}")
+
+    print("[3/7] Extracting melody …")
+    melody_beats = pyin_extract_melody(y, sr, beat_times)
+
+    print("[4/7] Detecting chords …")
+    chords = chromagram_detect_chords(y, sr, beat_times, beats_per_measure)
+
+    print("[5/7] Simplifying rhythm …")
+    simplified = beat_simplify_rhythm(melody_beats, beats_per_measure)
+
+    print("[6/7] Assigning SATB voices …")
+    parts = assign_satb(simplified, chords, beats_per_measure)
+
+    print("[7/7] Assigning syllables …")
+    syllables = assign_syllables_satb(parts, lyrics)
+
+    def midi_to_name(m):
+        if m is None:
+            return "rest"
+        names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+        return f"{names[m % 12]}{(m // 12) - 1}"
+
+    arrangement = {
+        "tempo":          bpm,
+        "time_signature": f"{beats_per_measure}/4",
+        "parts_order":    ["solo", "S", "A", "T", "B"],
+        "parts": {
+            v: [
+                {
+                    "start_beat":     seg["start_beat"],
+                    "pitch":          midi_to_name(seg["midi"]),
+                    "midi":           seg["midi"],
+                    "duration_beats": seg["duration_beats"],
+                    "duration_type":  "whole" if seg["duration_beats"] == 4 else "half",
+                }
+                for seg in parts[v]
+            ]
+            for v in ("solo", "S", "A", "T", "B")
+        },
+        "syllables": {
+            "solo": syllables.get("solo", "ah") if not isinstance(syllables.get("solo"), list)
+                    else " ".join(syllables["solo"]),
+            "S":    syllables.get("S", "oo"),
+            "A":    syllables.get("A", "ah"),
+            "T":    syllables.get("T", "oh"),
+            "B":    syllables.get("B", "doo"),
+        },
+    }
+
+    with open(output_json, "w") as f:
+        _json.dump(arrangement, f, indent=2)
+    print(f"\n✓ JSON saved → {output_json}")
+
+    score = build_score(parts, syllables, bpm, beats_per_measure)
+    score.write("musicxml", fp=output_xml)
+    print(f"✓ MusicXML saved → {output_xml}")
+
+    return arrangement
+
+
+# ===========================================================================
+# End of MP3 → SATB Pipeline
+# ===========================================================================
 
 
 def load_musicxml_and_arrange(musicxml_filepath):

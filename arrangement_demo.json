@@ -1,0 +1,177 @@
+{
+  "tempo": 96.0,
+  "time_signature": "4/4",
+  "parts_order": [
+    "solo",
+    "S",
+    "A",
+    "T",
+    "B"
+  ],
+  "parts": {
+    "solo": [
+      {
+        "start_beat": 0,
+        "pitch": "G4",
+        "midi": 67,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 4,
+        "pitch": "E4",
+        "midi": 64,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 8,
+        "pitch": "F4",
+        "midi": 65,
+        "duration_beats": 2,
+        "duration_type": "half"
+      },
+      {
+        "start_beat": 10,
+        "pitch": "G4",
+        "midi": 67,
+        "duration_beats": 2,
+        "duration_type": "half"
+      },
+      {
+        "start_beat": 12,
+        "pitch": "rest",
+        "midi": null,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      }
+    ],
+    "S": [
+      {
+        "start_beat": 0,
+        "pitch": "rest",
+        "midi": null,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 4,
+        "pitch": "rest",
+        "midi": null,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 8,
+        "pitch": "rest",
+        "midi": null,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 12,
+        "pitch": "E5",
+        "midi": 76,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      }
+    ],
+    "A": [
+      {
+        "start_beat": 0,
+        "pitch": "E4",
+        "midi": 64,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 4,
+        "pitch": "C4",
+        "midi": 60,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 8,
+        "pitch": "D4",
+        "midi": 62,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 12,
+        "pitch": "C5",
+        "midi": 72,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      }
+    ],
+    "T": [
+      {
+        "start_beat": 0,
+        "pitch": "B3",
+        "midi": 59,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 4,
+        "pitch": "G3",
+        "midi": 55,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 8,
+        "pitch": "A3",
+        "midi": 57,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 12,
+        "pitch": "G3",
+        "midi": 55,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      }
+    ],
+    "B": [
+      {
+        "start_beat": 0,
+        "pitch": "C3",
+        "midi": 48,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 4,
+        "pitch": "C3",
+        "midi": 48,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 8,
+        "pitch": "F3",
+        "midi": 53,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      },
+      {
+        "start_beat": 12,
+        "pitch": "C3",
+        "midi": 48,
+        "duration_beats": 4,
+        "duration_type": "whole"
+      }
+    ]
+  },
+  "syllables": {
+    "solo": "ah",
+    "S": "oo",
+    "A": "ah",
+    "T": "oh",
+    "B": "doo"
+  }
+}

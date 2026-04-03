@@ -102,6 +102,16 @@ def download_file(filename):
     return jsonify({'error': 'File not found'}), 404
 
 if __name__ == '__main__':
+    print("╔══════════════════════════════════════════════════╗")
+    print("║      Arrangr — SATB + Soloist A Cappella         ║")
+    print("║   MP3 → Melody · Harmony · Chords · MusicXML    ║")
+    print("╠══════════════════════════════════════════════════╣")
+    print("║  Upload an MP3 and get a full SATB arrangement   ║")
+    print("║  Solo · Soprano · Alto · Tenor · Bass            ║")
+    print("╠══════════════════════════════════════════════════╣")
+    print("║  Running at → http://localhost:5000              ║")
+    print("╚══════════════════════════════════════════════════╝")
+    print()
     print("Starting Arrangr Web GUI...")
     print("Open your browser and go to: http://localhost:5000")
     app.run(debug=False, host='localhost', port=5000)
