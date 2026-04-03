@@ -53,10 +53,18 @@ def upload_file():
             jobs[job_id]['status'] = 'Creating SATB arrangement'
             jobs[job_id]['message'] = 'Creating SATB arrangement...'
 
-            # Extract song title from filename
-            title = os.path.splitext(original_name)[0]
-            
-            score = arrange(chord_prog, melody, title=title, key_signature=key_sig, tempo_bpm=tempo_bpm)
+            # Extract song title and artist from filename ("Artist - Title" format)
+            stem = os.path.splitext(original_name)[0]
+            if ' - ' in stem:
+                artist, title = stem.split(' - ', 1)
+                artist = artist.strip()
+                title  = title.strip()
+            else:
+                artist = ''
+                title  = stem
+
+            score = arrange(chord_prog, melody, title=title, artist=artist,
+                            key_signature=key_sig, tempo_bpm=tempo_bpm)
             output_filename = os.path.splitext(original_name)[0] + '_arranged.musicxml'
             output_path = os.path.join(UPLOAD_FOLDER, output_filename)
             score.write('musicxml', fp=output_path)

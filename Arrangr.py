@@ -184,20 +184,26 @@ def assign_syllables(lyrics: Optional[list] = None) -> dict:
 
 # ── Step 8: Build music21 Score ───────────────────────────────────────────────
 def build_score(parts: dict, syllables: dict, bpm: int,
-                key_sharps: int = 3) -> stream.Score:
+                key_sharps: int = 3,
+                title: str = 'A Cappella Arrangement',
+                artist: str = '') -> stream.Score:
     sc = stream.Score()
     sc.metadata = metadata.Metadata()
-    sc.metadata.title = 'A Cappella Arrangement'
+    sc.metadata.title = title
+    if artist:
+        sc.metadata.composer = artist
+    sc.metadata.composer = (artist + '\narr: Arrangr') if artist else 'arr: Arrangr'
     VOICE_CONFIG = [
-        ('Soloist', 'solo', clef.TrebleClef()),
-        ('Soprano', 'S',    clef.TrebleClef()),
-        ('Alto',    'A',    clef.TrebleClef()),
-        ('Tenor',   'T',    clef.TrebleClef()),
-        ('Bass',    'B',    clef.BassClef()),
+        ('Soloist', 'Solo.', 'solo', clef.TrebleClef()),
+        ('Soprano', 'S.',    'S',    clef.TrebleClef()),
+        ('Alto',    'A.',    'A',    clef.TrebleClef()),
+        ('Tenor',   'T.',    'T',    clef.TrebleClef()),
+        ('Bass',    'B.',    'B',    clef.BassClef()),
     ]
-    for (vname, vkey, vclef) in VOICE_CONFIG:
+    for (vname, vabbr, vkey, vclef) in VOICE_CONFIG:
         p   = stream.Part()
         p.partName = vname
+        p.partAbbreviation = vabbr
         syl = syllables.get(vkey, 'ah')
         for m_idx, midi_val in enumerate(parts[vkey]):
             m_obj = stream.Measure(number=m_idx + 1)
@@ -261,11 +267,9 @@ def audio_to_chords_and_melody(audio_file_path: str,
 
 
 def arrange(parts, syllables, title: str = 'A Cappella Arrangement',
-            key_signature: int = 3, tempo_bpm: int = 120) -> stream.Score:
+            artist: str = '', key_signature: int = 3, tempo_bpm: int = 120) -> stream.Score:
     """Build and return a music21 Score. Called by app.py after audio_to_chords_and_melody()."""
-    score = build_score(parts, syllables, tempo_bpm, key_signature)
-    score.metadata.title = title
-    return score
+    return build_score(parts, syllables, tempo_bpm, key_signature, title=title, artist=artist)
 
 
 # ── Full pipeline (MP3 → JSON + MusicXML) ─────────────────────────────────────

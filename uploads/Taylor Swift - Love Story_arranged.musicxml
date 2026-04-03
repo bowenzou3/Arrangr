@@ -2,11 +2,12 @@
 <!DOCTYPE score-partwise  PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
 <score-partwise version="4.0">
   <work>
-    <work-title>Taylor Swift - Love Story</work-title>
+    <work-title>Love Story</work-title>
   </work>
-  <movement-title>Taylor Swift - Love Story</movement-title>
+  <movement-title>Love Story</movement-title>
   <identification>
-    <creator type="composer">Music21</creator>
+    <creator type="composer">Taylor Swift
+arr: Arrangr</creator>
     <encoding>
       <encoding-date>2026-04-03</encoding-date>
       <software>music21 v.9.9.1</software>
@@ -19,24 +20,29 @@
     </scaling>
   </defaults>
   <part-list>
-    <score-part id="Pc3a55aa026c6f05cf9fffdd5df444e21">
+    <score-part id="P050d2c6ab12f94bb5fb11219fd74aa69">
       <part-name>Soloist</part-name>
+      <part-abbreviation>Solo.</part-abbreviation>
     </score-part>
-    <score-part id="Paef9178858e57ca588016cebed07ffe0">
+    <score-part id="Pb1e3883b674d4058bd2e76f98445433a">
       <part-name>Soprano</part-name>
+      <part-abbreviation>S.</part-abbreviation>
     </score-part>
-    <score-part id="P58b415b4fd66119105e2f6a617ce5061">
+    <score-part id="Pd319e081d8c096dbbe1150af8978e981">
       <part-name>Alto</part-name>
+      <part-abbreviation>A.</part-abbreviation>
     </score-part>
-    <score-part id="Pb76ee48d3a1cda55cfba525915b062cb">
+    <score-part id="P6e8dc18104b6139969eabbe2496763e1">
       <part-name>Tenor</part-name>
+      <part-abbreviation>T.</part-abbreviation>
     </score-part>
-    <score-part id="P1ecb8cc6e0d8ad562b18ee2cd87b591f">
+    <score-part id="Pad1d2030925354614be85710eab8b751">
       <part-name>Bass</part-name>
+      <part-abbreviation>B.</part-abbreviation>
     </score-part>
   </part-list>
   <!--=========================== Part 1 ===========================-->
-  <part id="Pc3a55aa026c6f05cf9fffdd5df444e21">
+  <part id="P050d2c6ab12f94bb5fb11219fd74aa69">
     <!--========================= Measure 1 ==========================-->
     <measure implicit="no" number="1">
       <attributes>
@@ -1896,7 +1902,7 @@
     </measure>
   </part>
   <!--=========================== Part 2 ===========================-->
-  <part id="Paef9178858e57ca588016cebed07ffe0">
+  <part id="Pb1e3883b674d4058bd2e76f98445433a">
     <!--========================= Measure 1 ==========================-->
     <measure implicit="no" number="1">
       <attributes>
@@ -2791,7 +2797,7 @@
     </measure>
   </part>
   <!--=========================== Part 3 ===========================-->
-  <part id="P58b415b4fd66119105e2f6a617ce5061">
+  <part id="Pd319e081d8c096dbbe1150af8978e981">
     <!--========================= Measure 1 ==========================-->
     <measure implicit="no" number="1">
       <attributes>
@@ -4681,7 +4687,7 @@
     </measure>
   </part>
   <!--=========================== Part 4 ===========================-->
-  <part id="Pb76ee48d3a1cda55cfba525915b062cb">
+  <part id="P6e8dc18104b6139969eabbe2496763e1">
     <!--========================= Measure 1 ==========================-->
     <measure implicit="no" number="1">
       <attributes>
@@ -6599,7 +6605,7 @@
     </measure>
   </part>
   <!--=========================== Part 5 ===========================-->
-  <part id="P1ecb8cc6e0d8ad562b18ee2cd87b591f">
+  <part id="Pad1d2030925354614be85710eab8b751">
     <!--========================= Measure 1 ==========================-->
     <measure implicit="no" number="1">
       <attributes>
