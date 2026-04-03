@@ -191,8 +191,8 @@ def build_score(parts: dict, syllables: dict, bpm: int,
     sc.metadata = metadata.Metadata()
     sc.metadata.title = title
     if artist:
-        sc.metadata.composer = artist
-    sc.metadata.composer = (artist + '\narr: Arrangr') if artist else 'arr: Arrangr'
+        sc.metadata.addContributor(metadata.Contributor(role='composer', name=artist))
+    sc.metadata.addContributor(metadata.Contributor(role='arranger', name='Arrangr'))
     VOICE_CONFIG = [
         ('Soloist', 'Solo.', 'solo', clef.TrebleClef()),
         ('Soprano', 'S.',    'S',    clef.TrebleClef()),
